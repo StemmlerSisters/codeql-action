@@ -151,18 +151,22 @@ export function getRecordingLogger(messages: LoggedMessage[]): Logger {
   return {
     debug: (message: string) => {
       messages.push({ type: "debug", message });
+      // eslint-disable-next-line no-console
       console.debug(message);
     },
     info: (message: string) => {
       messages.push({ type: "info", message });
+      // eslint-disable-next-line no-console
       console.info(message);
     },
     warning: (message: string | Error) => {
       messages.push({ type: "warning", message });
+      // eslint-disable-next-line no-console
       console.warn(message);
     },
     error: (message: string | Error) => {
       messages.push({ type: "error", message });
+      // eslint-disable-next-line no-console
       console.error(message);
     },
     isDebug: () => true,
@@ -282,27 +286,34 @@ export function mockBundleDownloadApi({
     process.platform === "win32"
       ? "win64"
       : process.platform === "linux"
-      ? "linux64"
-      : "osx64";
+        ? "linux64"
+        : "osx64";
 
   const baseUrl = apiDetails?.url ?? "https://example.com";
-  const relativeUrl = apiDetails
-    ? `/${repo}/releases/download/${tagName}/codeql-bundle${
-        platformSpecific ? `-${platform}` : ""
-      }.tar.gz`
-    : `/download/${tagName}/codeql-bundle.tar.gz`;
 
-  nock(baseUrl)
-    .get(relativeUrl)
-    .replyWithFile(
-      200,
-      path.join(
-        __dirname,
-        `/../src/testdata/codeql-bundle${isPinned ? "-pinned" : ""}.tar.gz`,
-      ),
-    );
+  const bundleUrls = ["tar.gz", "tar.zst"].map((extension) => {
+    const relativeUrl = apiDetails
+      ? `/${repo}/releases/download/${tagName}/codeql-bundle${
+          platformSpecific ? `-${platform}` : ""
+        }.${extension}`
+      : `/download/${tagName}/codeql-bundle.${extension}`;
 
-  return `${baseUrl}${relativeUrl}`;
+    nock(baseUrl)
+      .get(relativeUrl)
+      .replyWithFile(
+        200,
+        path.join(
+          __dirname,
+          `/../src/testdata/codeql-bundle${
+            isPinned ? "-pinned" : ""
+          }.${extension}`,
+        ),
+      );
+    return `${baseUrl}${relativeUrl}`;
+  });
+
+  // Choose an arbitrary URL to return
+  return bundleUrls[0];
 }
 
 export function createTestConfig(overrides: Partial<Config>): Config {
@@ -327,6 +338,7 @@ export function createTestConfig(overrides: Partial<Config>): Config {
       },
       trapCaches: {},
       trapCacheDownloadTime: 0,
+      dependencyCachingEnabled: false,
     },
     overrides,
   );

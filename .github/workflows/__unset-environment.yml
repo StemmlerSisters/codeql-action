@@ -7,7 +7,6 @@ name: PR Check - Test unsetting environment variables
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
-  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
@@ -28,37 +27,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-12
-            version: stable-v2.14.6
-          - os: macos-latest
-            version: stable-v2.15.5
-          - os: macos-latest
-            version: stable-v2.16.6
-          - os: macos-latest
-            version: latest
-          - os: macos-latest
-            version: default
-          - os: macos-latest
+          - os: ubuntu-latest
+            version: linked
+          - os: ubuntu-latest
             version: nightly-latest
     name: Test unsetting environment variables
     permissions:
       contents: read
-      security-events: write
+      security-events: read
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Setup Python on MacOS
-        uses: actions/setup-python@v5
-        if: >-
-          runner.os == 'macOS' && (
-
-          matrix.version == 'stable-20230403' ||
-
-          matrix.version == 'stable-v2.13.5' ||
-
-          matrix.version == 'stable-v2.14.6')
-        with:
-          python-version: '3.11'
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Prepare test
@@ -67,23 +46,20 @@ jobs:
         with:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
+          setup-kotlin: 'true'
       - uses: ./../action/init
         id: init
         with:
           db-location: ${{ runner.temp }}/customDbLocation
+      # Swift is not supported on Ubuntu so we manually exclude it from the list here
+          languages: cpp,csharp,go,java,javascript,python,ruby
           tools: ${{ steps.prepare-test.outputs.tools-url }}
-      - uses: ./../action/.github/actions/setup-swift
-        with:
-          codeql-path: ${{ steps.init.outputs.codeql-path }}
       - uses: actions/setup-go@v5
         with:
           go-version: '>=1.21.0'
       - name: Build code
         shell: bash
-    # Disable Kotlin analysis while it's incompatible with Kotlin 1.8, until we find a
-    # workaround for our PR checks.
-        run: env -i CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN=true PATH="$PATH" HOME="$HOME"
-          ./build.sh
+        run: env -i PATH="$PATH" HOME="$HOME" ./build.sh
       - uses: ./../action/analyze
         id: analysis
         with:

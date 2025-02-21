@@ -35,13 +35,11 @@ test("post: init action with debug mode off", async (t) => {
       packs: [],
     } as unknown as configUtils.Config);
 
-    const uploadDatabaseBundleSpy = sinon.spy();
-    const uploadLogsSpy = sinon.spy();
+    const uploadAllAvailableDebugArtifactsSpy = sinon.spy();
     const printDebugLogsSpy = sinon.spy();
 
     await initActionPostHelper.run(
-      uploadDatabaseBundleSpy,
-      uploadLogsSpy,
+      uploadAllAvailableDebugArtifactsSpy,
       printDebugLogsSpy,
       createTestConfig({ debugMode: false }),
       parseRepositoryNwo("github/codeql-action"),
@@ -49,8 +47,7 @@ test("post: init action with debug mode off", async (t) => {
       getRunnerLogger(true),
     );
 
-    t.assert(uploadDatabaseBundleSpy.notCalled);
-    t.assert(uploadLogsSpy.notCalled);
+    t.assert(uploadAllAvailableDebugArtifactsSpy.notCalled);
     t.assert(printDebugLogsSpy.notCalled);
   });
 });
@@ -60,13 +57,11 @@ test("post: init action with debug mode on", async (t) => {
     process.env["GITHUB_REPOSITORY"] = "github/codeql-action-fake-repository";
     process.env["RUNNER_TEMP"] = tmpDir;
 
-    const uploadDatabaseBundleSpy = sinon.spy();
-    const uploadLogsSpy = sinon.spy();
+    const uploadAllAvailableDebugArtifactsSpy = sinon.spy();
     const printDebugLogsSpy = sinon.spy();
 
     await initActionPostHelper.run(
-      uploadDatabaseBundleSpy,
-      uploadLogsSpy,
+      uploadAllAvailableDebugArtifactsSpy,
       printDebugLogsSpy,
       createTestConfig({ debugMode: true }),
       parseRepositoryNwo("github/codeql-action"),
@@ -74,8 +69,7 @@ test("post: init action with debug mode on", async (t) => {
       getRunnerLogger(true),
     );
 
-    t.assert(uploadDatabaseBundleSpy.called);
-    t.assert(uploadLogsSpy.called);
+    t.assert(uploadAllAvailableDebugArtifactsSpy.called);
     t.assert(printDebugLogsSpy.called);
   });
 });
@@ -359,7 +353,7 @@ async function testFailedSarifUpload(
 
   const codeqlObject = await codeql.getCodeQLForTesting();
   sinon.stub(codeql, "getCodeQL").resolves(codeqlObject);
-  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.12.6"));
+  sinon.stub(codeqlObject, "getVersion").resolves(makeVersionInfo("2.17.6"));
   const databaseExportDiagnosticsStub = sinon.stub(
     codeqlObject,
     "databaseExportDiagnostics",
@@ -368,8 +362,8 @@ async function testFailedSarifUpload(
 
   sinon.stub(workflow, "getWorkflow").resolves(actionsWorkflow);
 
-  const uploadFromActions = sinon.stub(uploadLib, "uploadFromActions");
-  uploadFromActions.resolves({
+  const uploadFiles = sinon.stub(uploadLib, "uploadFiles");
+  uploadFiles.resolves({
     sarifID: "42",
     statusReport: { raw_upload_size_bytes: 20, zipped_upload_size_bytes: 10 },
   } as uploadLib.UploadResult);
@@ -398,10 +392,8 @@ async function testFailedSarifUpload(
           config.dbLocation,
           sinon.match.string,
           category,
-          sinon.match.any,
-          sinon.match.any,
         ),
-        `Actual args were: ${databaseExportDiagnosticsStub.args}`,
+        `Actual args were: ${JSON.stringify(databaseExportDiagnosticsStub.args)}`,
       );
     } else {
       t.true(
@@ -410,17 +402,18 @@ async function testFailedSarifUpload(
           category,
           config,
         ),
-        `Actual args were: ${diagnosticsExportStub.args}`,
+        `Actual args were: ${JSON.stringify(diagnosticsExportStub.args)}`,
       );
     }
     t.true(
-      uploadFromActions.calledOnceWith(
+      uploadFiles.calledOnceWith(
         sinon.match.string,
         sinon.match.string,
         category,
         sinon.match.any,
+        sinon.match.any,
       ),
-      `Actual args were: ${uploadFromActions.args}`,
+      `Actual args were: ${JSON.stringify(uploadFiles.args)}`,
     );
     t.true(
       waitForProcessing.calledOnceWith(sinon.match.any, "42", sinon.match.any, {
@@ -429,7 +422,7 @@ async function testFailedSarifUpload(
     );
   } else {
     t.true(diagnosticsExportStub.notCalled);
-    t.true(uploadFromActions.notCalled);
+    t.true(uploadFiles.notCalled);
     t.true(waitForProcessing.notCalled);
   }
   return result;

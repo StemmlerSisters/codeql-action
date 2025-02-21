@@ -1,10 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
 
-import * as exec from "@actions/exec/lib/exec";
 import * as toolrunner from "@actions/exec/lib/toolrunner";
-import * as safeWhich from "@chrisgavin/safe-which";
+import * as io from "@actions/io";
 
+import { getOptionalInput, isSelfHostedRunner } from "./actions-util";
 import { GitHubApiCombinedDetails, GitHubApiDetails } from "./api-client";
 import { CodeQL, setupCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
@@ -12,6 +12,8 @@ import { CodeQLDefaultVersionInfo, FeatureEnablement } from "./feature-flags";
 import { Language, isScannedLanguage } from "./languages";
 import { Logger } from "./logging";
 import { ToolsSource } from "./setup-codeql";
+import { ZstdAvailability } from "./tar";
+import { ToolsDownloadStatusReport } from "./tools-download";
 import { ToolsFeature } from "./tools-features";
 import { TracerConfig, getCombinedTracerConfig } from "./tracer-config";
 import * as util from "./util";
@@ -22,27 +24,41 @@ export async function initCodeQL(
   tempDir: string,
   variant: util.GitHubVariant,
   defaultCliVersion: CodeQLDefaultVersionInfo,
+  features: FeatureEnablement,
   logger: Logger,
 ): Promise<{
   codeql: CodeQL;
-  toolsDownloadDurationMs?: number;
+  toolsDownloadStatusReport?: ToolsDownloadStatusReport;
   toolsSource: ToolsSource;
   toolsVersion: string;
+  zstdAvailability: ZstdAvailability;
 }> {
   logger.startGroup("Setup CodeQL tools");
-  const { codeql, toolsDownloadDurationMs, toolsSource, toolsVersion } =
-    await setupCodeQL(
-      toolsInput,
-      apiDetails,
-      tempDir,
-      variant,
-      defaultCliVersion,
-      logger,
-      true,
-    );
+  const {
+    codeql,
+    toolsDownloadStatusReport,
+    toolsSource,
+    toolsVersion,
+    zstdAvailability,
+  } = await setupCodeQL(
+    toolsInput,
+    apiDetails,
+    tempDir,
+    variant,
+    defaultCliVersion,
+    logger,
+    features,
+    true,
+  );
   await codeql.printVersion();
   logger.endGroup();
-  return { codeql, toolsDownloadDurationMs, toolsSource, toolsVersion };
+  return {
+    codeql,
+    toolsDownloadStatusReport,
+    toolsSource,
+    toolsVersion,
+    zstdAvailability,
+  };
 }
 
 export async function initConfig(
@@ -70,7 +86,6 @@ export async function runInit(
   processName: string | undefined,
   registriesInput: string | undefined,
   apiDetails: GitHubApiCombinedDetails,
-  features: FeatureEnablement,
   logger: Logger,
 ): Promise<TracerConfig | undefined> {
   fs.mkdirSync(config.dbLocation, { recursive: true });
@@ -94,11 +109,10 @@ export async function runInit(
         sourceRoot,
         processName,
         qlconfigFile,
-        features,
         logger,
       ),
   );
-  return await getCombinedTracerConfig(codeql, config, features);
+  return await getCombinedTracerConfig(codeql, config);
 }
 
 export function printPathFiltersWarning(
@@ -136,38 +150,60 @@ export async function checkInstallPython311(
       "../python-setup",
       "check_python12.ps1",
     );
-    await new toolrunner.ToolRunner(await safeWhich.safeWhich("powershell"), [
+    await new toolrunner.ToolRunner(await io.which("powershell", true), [
       script,
     ]).exec();
   }
 }
 
-// For MacOS runners: runs `csrutil status` to determine whether System
-// Integrity Protection is enabled.
-export async function isSipEnabled(logger): Promise<boolean | undefined> {
-  try {
-    const sipStatusOutput = await exec.getExecOutput("csrutil status");
-    if (sipStatusOutput.exitCode === 0) {
-      if (
-        sipStatusOutput.stdout.includes(
-          "System Integrity Protection status: enabled.",
-        )
-      ) {
-        return true;
-      }
-      if (
-        sipStatusOutput.stdout.includes(
-          "System Integrity Protection status: disabled.",
-        )
-      ) {
-        return false;
+export function cleanupDatabaseClusterDirectory(
+  config: configUtils.Config,
+  logger: Logger,
+  // We can't stub the fs module in tests, so we allow the caller to override the rmSync function
+  // for testing.
+  rmSync = fs.rmSync,
+): void {
+  if (
+    fs.existsSync(config.dbLocation) &&
+    (fs.statSync(config.dbLocation).isFile() ||
+      fs.readdirSync(config.dbLocation).length)
+  ) {
+    logger.warning(
+      `The database cluster directory ${config.dbLocation} must be empty. Attempting to clean it up.`,
+    );
+    try {
+      rmSync(config.dbLocation, {
+        force: true,
+        maxRetries: 3,
+        recursive: true,
+      });
+
+      logger.info(
+        `Cleaned up database cluster directory ${config.dbLocation}.`,
+      );
+    } catch (e) {
+      const blurb = `The CodeQL Action requires an empty database cluster directory. ${
+        getOptionalInput("db-location")
+          ? `This is currently configured to be ${config.dbLocation}. `
+          : `By default, this is located at ${config.dbLocation}. ` +
+            "You can customize it using the 'db-location' input to the init Action. "
+      }An attempt was made to clean up the directory, but this failed.`;
+
+      // Hosted runners are automatically cleaned up, so this error should not occur for hosted runners.
+      if (isSelfHostedRunner()) {
+        throw new util.ConfigurationError(
+          `${blurb} This can happen if another process is using the directory or the directory is owned by a different user. ` +
+            `Please clean up the directory manually and rerun the job. Details: ${util.getErrorMessage(
+              e,
+            )}`,
+        );
+      } else {
+        throw new Error(
+          `${blurb} This shouldn't typically happen on hosted runners. ` +
+            "If you are using an advanced setup, please check your workflow, otherwise we " +
+            `recommend rerunning the job. Details: ${util.getErrorMessage(e)}`,
+        );
       }
     }
-    return undefined;
-  } catch (e) {
-    logger.warning(
-      `Failed to determine if System Integrity Protection was enabled: ${e}`,
-    );
-    return undefined;
   }
 }

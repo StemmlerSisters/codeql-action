@@ -7,10 +7,17 @@ import * as actionsUtil from "./actions-util";
 import * as apiClient from "./api-client";
 import { CodeQL } from "./codeql";
 import type { Config } from "./config-utils";
+import { DocUrl } from "./doc-url";
 import { Feature, FeatureEnablement } from "./feature-flags";
+import * as gitUtils from "./git-utils";
 import { Language } from "./languages";
 import { Logger } from "./logging";
-import { isHTTPError, tryGetFolderBytes, withTimeout, wrapError } from "./util";
+import {
+  getErrorMessage,
+  isHTTPError,
+  tryGetFolderBytes,
+  withTimeout,
+} from "./util";
 
 // This constant should be bumped if we make a breaking change
 // to how the CodeQL Action stores or retrieves the TRAP cache,
@@ -65,7 +72,7 @@ export async function downloadTrapCaches(
     result[language] = cacheDir;
   }
 
-  if (await actionsUtil.isAnalyzingDefaultBranch()) {
+  if (await gitUtils.isAnalyzingDefaultBranch()) {
     logger.info(
       "Analyzing default branch. Skipping downloading of TRAP caches.",
     );
@@ -125,7 +132,7 @@ export async function uploadTrapCaches(
   config: Config,
   logger: Logger,
 ): Promise<boolean> {
-  if (!(await actionsUtil.isAnalyzingDefaultBranch())) return false; // Only upload caches from the default branch
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) return false; // Only upload caches from the default branch
 
   for (const language of config.languages) {
     const cacheDir = config.trapCaches[language];
@@ -178,7 +185,7 @@ export async function cleanupTrapCaches(
       trap_cache_cleanup_skipped_because: "feature disabled",
     };
   }
-  if (!(await actionsUtil.isAnalyzingDefaultBranch())) {
+  if (!(await gitUtils.isAnalyzingDefaultBranch())) {
     return {
       trap_cache_cleanup_skipped_because: "not analyzing default branch",
     };
@@ -189,7 +196,7 @@ export async function cleanupTrapCaches(
 
     const allCaches = await apiClient.listActionsCaches(
       CODEQL_TRAP_CACHE_PREFIX,
-      await actionsUtil.getRef(),
+      await gitUtils.getRef(),
     );
 
     for (const language of config.languages) {
@@ -233,12 +240,12 @@ export async function cleanupTrapCaches(
       logger.warning(
         "Could not cleanup TRAP caches as the token did not have the required permissions. " +
           'To clean up TRAP caches, ensure the token has the "actions:write" permission. ' +
-          "For more information, see https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs",
+          `See ${DocUrl.ASSIGNING_PERMISSIONS_TO_JOBS} for more information.`,
       );
     } else {
       logger.info(`Failed to cleanup TRAP caches, continuing. Details: ${e}`);
     }
-    return { trap_cache_cleanup_error: wrapError(e).message };
+    return { trap_cache_cleanup_error: getErrorMessage(e) };
   }
 }
 
@@ -304,18 +311,6 @@ export async function getLanguagesSupportingCaching(
     result.push(lang);
   }
   return result;
-}
-
-export async function getTotalCacheSize(
-  trapCaches: Partial<Record<Language, string>>,
-  logger: Logger,
-): Promise<number> {
-  const sizes = await Promise.all(
-    Object.values(trapCaches).map((cacheDir) =>
-      tryGetFolderBytes(cacheDir, logger),
-    ),
-  );
-  return sizes.map((a) => a || 0).reduce((a, b) => a + b, 0);
 }
 
 async function cacheKey(

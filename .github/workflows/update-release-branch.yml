@@ -22,6 +22,8 @@ jobs:
       latest_tag: ${{ steps.versions.outputs.latest_tag }}
       backport_source_branch: ${{ steps.branches.outputs.backport_source_branch }}
       backport_target_branches: ${{ steps.branches.outputs.backport_target_branches }}
+    permissions:
+      contents: read
     steps:
     - uses: actions/checkout@v4
       with:
@@ -63,6 +65,9 @@ jobs:
       REPOSITORY: "${{ github.repository }}"
       MAJOR_VERSION: "${{ needs.prepare.outputs.major_version }}"
       LATEST_TAG: "${{ needs.prepare.outputs.latest_tag }}"
+    permissions:
+      contents: write # needed to push commits
+      pull-requests: write # needed to create pull request
     steps:
     - uses: actions/checkout@v4
       with:
@@ -104,6 +109,7 @@ jobs:
   backport:
     timeout-minutes: 45
     runs-on: ubuntu-latest
+    environment: Automation
     needs: [prepare]
     if: ${{ (github.event_name == 'push') && needs.prepare.outputs.backport_target_branches != '[]' }}
     strategy:
@@ -113,10 +119,22 @@ jobs:
     env:
       SOURCE_BRANCH: ${{ needs.prepare.outputs.backport_source_branch }}
       TARGET_BRANCH: ${{ matrix.target_branch }}
+    permissions:
+      contents: write # needed to push commits
+      pull-requests: write # needed to create pull request
     steps:
-    - uses: actions/checkout@v4
+    - name: Generate token
+      uses: actions/create-github-app-token@0d564482f06ca65fa9e77e2510873638c82206f2
+      id: app-token
+      with:
+        app-id: ${{ vars.AUTOMATION_APP_ID }}
+        private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
+
+    - name: Checkout
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0  # Need full history for calculation of diffs
+        token: ${{ steps.app-token.outputs.token }}
     - uses: ./.github/actions/release-initialise
 
     - name: Update older release branch

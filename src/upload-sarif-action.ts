@@ -1,8 +1,9 @@
 import * as core from "@actions/core";
 
 import * as actionsUtil from "./actions-util";
-import { getActionVersion } from "./actions-util";
+import { getActionVersion, getTemporaryDirectory } from "./actions-util";
 import { getGitHubVersion } from "./api-client";
+import { Features } from "./feature-flags";
 import { Logger, getActionsLogger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
 import {
@@ -18,6 +19,7 @@ import {
   ConfigurationError,
   checkActionVersion,
   checkDiskUsage,
+  getErrorMessage,
   getRequiredEnvParam,
   initializeEnvironment,
   isInTestMode,
@@ -38,7 +40,7 @@ async function sendSuccessStatusReport(
     "success",
     startedAt,
     undefined,
-    await checkDiskUsage(),
+    await checkDiskUsage(logger),
     logger,
   );
   if (statusReportBase !== undefined) {
@@ -58,12 +60,25 @@ async function run() {
   const gitHubVersion = await getGitHubVersion();
   checkActionVersion(getActionVersion(), gitHubVersion);
 
+  // Make inputs accessible in the `post` step.
+  actionsUtil.persistInputs();
+
+  const repositoryNwo = parseRepositoryNwo(
+    getRequiredEnvParam("GITHUB_REPOSITORY"),
+  );
+  const features = new Features(
+    gitHubVersion,
+    repositoryNwo,
+    getTemporaryDirectory(),
+    logger,
+  );
+
   const startingStatusReportBase = await createStatusReportBase(
     ActionName.UploadSarif,
     "starting",
     startedAt,
     undefined,
-    await checkDiskUsage(),
+    await checkDiskUsage(logger),
     logger,
   );
   if (startingStatusReportBase !== undefined) {
@@ -71,10 +86,11 @@ async function run() {
   }
 
   try {
-    const uploadResult = await upload_lib.uploadFromActions(
+    const uploadResult = await upload_lib.uploadFiles(
       actionsUtil.getRequiredInput("sarif_file"),
       actionsUtil.getRequiredInput("checkout_path"),
       actionsUtil.getOptionalInput("category"),
+      features,
       logger,
     );
     core.setOutput("sarif-id", uploadResult.sarifID);
@@ -98,14 +114,13 @@ async function run() {
         : wrapError(unwrappedError);
     const message = error.message;
     core.setFailed(message);
-    console.log(error);
 
     const errorStatusReportBase = await createStatusReportBase(
       ActionName.UploadSarif,
       getActionsStatus(error),
       startedAt,
       undefined,
-      await checkDiskUsage(),
+      await checkDiskUsage(logger),
       logger,
       message,
       error.stack,
@@ -122,7 +137,7 @@ async function runWrapper() {
     await run();
   } catch (error) {
     core.setFailed(
-      `codeql/upload-sarif action failed: ${wrapError(error).message}`,
+      `codeql/upload-sarif action failed: ${getErrorMessage(error)}`,
     );
   }
 }

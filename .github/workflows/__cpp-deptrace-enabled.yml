@@ -7,7 +7,6 @@ name: 'PR Check - C/C++: autoinstalling dependencies (Linux)'
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
-  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
@@ -29,7 +28,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            version: latest
+            version: linked
           - os: ubuntu-latest
             version: default
           - os: ubuntu-latest
@@ -37,22 +36,10 @@ jobs:
     name: 'C/C++: autoinstalling dependencies (Linux)'
     permissions:
       contents: read
-      security-events: write
+      security-events: read
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Setup Python on MacOS
-        uses: actions/setup-python@v5
-        if: >-
-          runner.os == 'macOS' && (
-
-          matrix.version == 'stable-20230403' ||
-
-          matrix.version == 'stable-v2.13.5' ||
-
-          matrix.version == 'stable-v2.14.6')
-        with:
-          python-version: '3.11'
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Prepare test
@@ -61,6 +48,7 @@ jobs:
         with:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
+          setup-kotlin: 'true'
       - name: Test setup
         shell: bash
         run: |

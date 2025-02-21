@@ -3,7 +3,7 @@ description: "Checks that our workaround for indirect tracing for Go 1.21+ on Li
 # only Linux is affected
 operatingSystems: ["ubuntu"]
 # pinned to a version which does not support statically linked binaries for indirect tracing
-versions: ["stable-v2.14.6"]
+versions: ["default"]
 steps:
   - uses: actions/setup-go@v5
     with:
@@ -17,8 +17,6 @@ steps:
     shell: bash
     run: go build main.go
   - uses: ./../action/analyze
-    with:
-      upload-database: false
   - shell: bash
     run: |
       if [[ -z "${CODEQL_ACTION_GO_BINARY}" ]]; then

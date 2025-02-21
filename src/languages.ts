@@ -1,5 +1,6 @@
 // All the languages supported by CodeQL
 export enum Language {
+  actions = "actions",
   csharp = "csharp",
   cpp = "cpp",
   go = "go",
@@ -7,6 +8,7 @@ export enum Language {
   javascript = "javascript",
   python = "python",
   ruby = "ruby",
+  rust = "rust",
   swift = "swift",
 }
 
@@ -17,6 +19,8 @@ export const LANGUAGE_ALIASES: { [lang: string]: Language } = {
   "c#": Language.csharp,
   kotlin: Language.java,
   typescript: Language.javascript,
+  "javascript-typescript": Language.javascript,
+  "java-kotlin": Language.java,
 };
 
 /**

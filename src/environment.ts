@@ -50,6 +50,15 @@ export enum EnvVar {
   /** Whether the init action has been run. */
   INIT_ACTION_HAS_RUN = "CODEQL_ACTION_INIT_HAS_RUN",
 
+  /** Whether the error for a deprecated version of the CodeQL Action was logged. */
+  LOG_VERSION_DEPRECATION = "CODEQL_ACTION_DID_LOG_VERSION_DEPRECATION",
+
+  /**
+   * For macOS. Result of `csrutil status` to determine whether System Integrity
+   * Protection is enabled.
+   */
+  IS_SIP_ENABLED = "CODEQL_ACTION_IS_SIP_ENABLED",
+
   /** UUID representing the current job run. */
   JOB_RUN_UUID = "JOB_RUN_UUID",
 
@@ -57,6 +66,9 @@ export enum EnvVar {
   JOB_STATUS = "CODEQL_ACTION_JOB_STATUS",
 
   ODASA_TRACER_CONFIGURATION = "ODASA_TRACER_CONFIGURATION",
+
+  /** The value of the `output` input for the analyze action. */
+  SARIF_RESULTS_OUTPUT_DIR = "CODEQL_ACTION_SARIF_RESULTS_OUTPUT_DIR",
 
   /**
    * What percentage of the total amount of RAM over 8 GB that the Action should reserve for the
@@ -89,4 +101,17 @@ export enum EnvVar {
    * We check this later to ensure that it hasn't been tampered with by a late e.g. `setup-go` step.
    */
   GO_BINARY_LOCATION = "CODEQL_ACTION_GO_BINARY",
+
+  /**
+   * Used as an alternative to the `dependency-caching` input for the `init` Action.
+   * Useful for experiments where it is easier to set an environment variable than
+   * change the inputs to the Action.
+   */
+  DEPENDENCY_CACHING = "CODEQL_ACTION_DEPENDENCY_CACHING",
+
+  /**
+   * An optional string to add into the cache key used by dependency caching.
+   * Useful for testing purposes where multiple caches may be stored in the same repository.
+   */
+  DEPENDENCY_CACHING_PREFIX = "CODEQL_ACTION_DEPENDENCY_CACHE_PREFIX",
 }

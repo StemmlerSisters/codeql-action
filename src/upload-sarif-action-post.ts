@@ -5,18 +5,43 @@
  */
 import * as core from "@actions/core";
 
+import * as actionsUtil from "./actions-util";
+import { getGitHubVersion } from "./api-client";
 import * as debugArtifacts from "./debug-artifacts";
-import * as uploadSarifActionPostHelper from "./upload-sarif-action-post-helper";
-import { wrapError } from "./util";
+import { EnvVar } from "./environment";
+import { getActionsLogger, withGroup } from "./logging";
+import { checkGitHubVersionInRange, getErrorMessage } from "./util";
 
 async function runWrapper() {
   try {
-    await uploadSarifActionPostHelper.uploadArtifacts(
-      debugArtifacts.uploadDebugArtifacts,
-    );
+    // Restore inputs from `upload-sarif` Action.
+    actionsUtil.restoreInputs();
+    const logger = getActionsLogger();
+    const gitHubVersion = await getGitHubVersion();
+    checkGitHubVersionInRange(gitHubVersion, logger);
+
+    // Upload SARIF artifacts if we determine that this is a third-party analysis run.
+    // For first-party runs, this artifact will be uploaded in the `analyze-post` step.
+    if (process.env[EnvVar.INIT_ACTION_HAS_RUN] !== "true") {
+      if (gitHubVersion.type === undefined) {
+        core.warning(
+          `Did not upload debug artifacts because cannot determine the GitHub variant running.`,
+        );
+        return;
+      }
+      await withGroup("Uploading combined SARIF debug artifact", () =>
+        debugArtifacts.uploadCombinedSarifArtifacts(
+          logger,
+          gitHubVersion.type,
+          // The codeqlVersion is not applicable for uploading non-codeql sarif.
+          // We can assume all versions are safe to upload.
+          undefined,
+        ),
+      );
+    }
   } catch (error) {
     core.setFailed(
-      `upload-sarif post-action step failed: ${wrapError(error).message}`,
+      `upload-sarif post-action step failed: ${getErrorMessage(error)}`,
     );
   }
 }

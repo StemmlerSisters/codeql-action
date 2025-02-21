@@ -23,14 +23,19 @@ jobs:
   code-scanning-config-tests:
     continue-on-error: true
 
+    permissions:
+      contents: read
+      packages: read
+      security-events: read
+
     strategy:
       fail-fast: false
       matrix:
         include:
         - os: ubuntu-latest
-          version: latest
+          version: linked
         - os: macos-latest
-          version: latest
+          version: linked
         - os: ubuntu-latest
           version: default
         - os: macos-latest

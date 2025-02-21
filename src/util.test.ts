@@ -4,6 +4,7 @@ import path from "path";
 
 import * as core from "@actions/core";
 import test from "ava";
+import * as yaml from "js-yaml";
 import * as sinon from "sinon";
 
 import * as api from "./api-client";
@@ -144,7 +145,7 @@ test("getExtraOptionsEnvParam() succeeds on valid JSON with invalid options (for
   process.env.CODEQL_ACTION_EXTRA_OPTIONS = origExtraOptions;
 });
 
-test("getExtraOptionsEnvParam() succeeds on valid options", (t) => {
+test("getExtraOptionsEnvParam() succeeds on valid JSON options", (t) => {
   const origExtraOptions = process.env.CODEQL_ACTION_EXTRA_OPTIONS;
 
   const options = { database: { init: ["--debug"] } };
@@ -155,10 +156,21 @@ test("getExtraOptionsEnvParam() succeeds on valid options", (t) => {
   process.env.CODEQL_ACTION_EXTRA_OPTIONS = origExtraOptions;
 });
 
+test("getExtraOptionsEnvParam() succeeds on valid YAML options", (t) => {
+  const origExtraOptions = process.env.CODEQL_ACTION_EXTRA_OPTIONS;
+
+  const options = { database: { init: ["--debug"] } };
+  process.env.CODEQL_ACTION_EXTRA_OPTIONS = yaml.dump(options);
+
+  t.deepEqual(util.getExtraOptionsEnvParam(), { ...options });
+
+  process.env.CODEQL_ACTION_EXTRA_OPTIONS = origExtraOptions;
+});
+
 test("getExtraOptionsEnvParam() fails on invalid JSON", (t) => {
   const origExtraOptions = process.env.CODEQL_ACTION_EXTRA_OPTIONS;
 
-  process.env.CODEQL_ACTION_EXTRA_OPTIONS = "{{invalid-json}}";
+  process.env.CODEQL_ACTION_EXTRA_OPTIONS = "{{invalid-json}";
   t.throws(util.getExtraOptionsEnvParam);
 
   process.env.CODEQL_ACTION_EXTRA_OPTIONS = origExtraOptions;
@@ -419,16 +431,16 @@ const CHECK_ACTION_VERSION_TESTS: Array<[string, util.GitHubVersion, boolean]> =
 for (const [
   version,
   githubVersion,
-  shouldReportWarning,
+  shouldReportError,
 ] of CHECK_ACTION_VERSION_TESTS) {
-  const reportWarningDescription = shouldReportWarning
-    ? "reports warning"
-    : "doesn't report warning";
+  const reportErrorDescription = shouldReportError
+    ? "reports error"
+    : "doesn't report error";
   const versionsDescription = `CodeQL Action version ${version} and GitHub version ${formatGitHubVersion(
     githubVersion,
   )}`;
-  test(`checkActionVersion ${reportWarningDescription} for ${versionsDescription}`, async (t) => {
-    const warningSpy = sinon.spy(core, "warning");
+  test(`checkActionVersion ${reportErrorDescription} for ${versionsDescription}`, async (t) => {
+    const warningSpy = sinon.spy(core, "error");
     const versionStub = sinon
       .stub(api, "getGitHubVersion")
       .resolves(githubVersion);
@@ -437,10 +449,12 @@ for (const [
     util.checkActionVersion(version, await api.getGitHubVersion());
     util.checkActionVersion(version, await api.getGitHubVersion());
 
-    if (shouldReportWarning) {
+    if (shouldReportError) {
       t.true(
         warningSpy.calledOnceWithExactly(
-          sinon.match("CodeQL Action v2 will be deprecated"),
+          sinon.match(
+            "CodeQL Action major versions v1 and v2 have been deprecated.",
+          ),
         ),
       );
     } else {

@@ -2,22 +2,24 @@ import * as fs from "fs";
 import * as path from "path";
 import { performance } from "perf_hooks";
 
-import { safeWhich } from "@chrisgavin/safe-which";
+import * as io from "@actions/io";
 import del from "del";
 import * as yaml from "js-yaml";
 
+import * as actionsUtil from "./actions-util";
+import { getApiClient } from "./api-client";
 import { setupCppAutobuild } from "./autobuild";
-import {
-  CODEQL_VERSION_ANALYSIS_SUMMARY_V2,
-  CodeQL,
-  getCodeQL,
-} from "./codeql";
+import { CodeQL, getCodeQL } from "./codeql";
 import * as configUtils from "./config-utils";
 import { addDiagnostic, makeDiagnostic } from "./diagnostics";
+import {
+  DiffThunkRange,
+  writeDiffRangesJsonFile,
+} from "./diff-filtering-utils";
 import { EnvVar } from "./environment";
 import { FeatureEnablement, Feature } from "./feature-flags";
 import { isScannedLanguage, Language } from "./languages";
-import { Logger } from "./logging";
+import { Logger, withGroupAsync } from "./logging";
 import { DatabaseCreationTimings, EventReport } from "./status-report";
 import { ToolsFeature } from "./tools-features";
 import { endTracingForCluster } from "./tracer-config";
@@ -26,13 +28,13 @@ import * as util from "./util";
 import { BuildMode } from "./util";
 
 export class CodeQLAnalysisError extends Error {
-  queriesStatusReport: QueriesStatusReport;
-
-  constructor(queriesStatusReport: QueriesStatusReport, message: string) {
+  constructor(
+    public queriesStatusReport: QueriesStatusReport,
+    public message: string,
+    public error: Error,
+  ) {
     super(message);
-
     this.name = "CodeQLAnalysisError";
-    this.queriesStatusReport = queriesStatusReport;
   }
 }
 
@@ -109,6 +111,12 @@ export interface QueriesStatusReport {
   interpret_results_ruby_duration_ms?: number;
   /** Time taken in ms to interpret results for swift (or undefined if this language was not analyzed). */
   interpret_results_swift_duration_ms?: number;
+
+  /**
+   * Whether the analysis is diff-informed (in the sense that the action generates a diff-range data
+   * extension for the analysis, regardless of whether the data extension is actually used by queries).
+   */
+  analysis_is_diff_informed?: boolean;
 
   /** Name of language that errored during analysis (or undefined if no language failed). */
   analyze_failure_language?: string;
@@ -190,7 +198,7 @@ export function dbIsFinalized(
       fs.readFileSync(path.resolve(dbPath, "codeql-database.yml"), "utf8"),
     ) as { inProgress?: boolean };
     return !("inProgress" in dbInfo);
-  } catch (e) {
+  } catch {
     logger.warning(
       `Could not check whether database for ${language} was finalized. Assuming it is not.`,
     );
@@ -234,12 +242,313 @@ async function finalizeDatabaseCreation(
   };
 }
 
+/**
+ * Set up the diff-informed analysis feature.
+ *
+ * @param baseRef The base branch name, used for calculating the diff range.
+ * @param headLabel The label that uniquely identifies the head branch across
+ * repositories, used for calculating the diff range.
+ * @param codeql
+ * @param logger
+ * @param features
+ * @returns Absolute path to the directory containing the extension pack for
+ * the diff range information, or `undefined` if the feature is disabled.
+ */
+export async function setupDiffInformedQueryRun(
+  baseRef: string,
+  headLabel: string,
+  codeql: CodeQL,
+  logger: Logger,
+  features: FeatureEnablement,
+): Promise<string | undefined> {
+  if (!(await features.getValue(Feature.DiffInformedQueries, codeql))) {
+    return undefined;
+  }
+  return await withGroupAsync(
+    "Generating diff range extension pack",
+    async () => {
+      const diffRanges = await getPullRequestEditedDiffRanges(
+        baseRef,
+        headLabel,
+        logger,
+      );
+      const packDir = writeDiffRangeDataExtensionPack(logger, diffRanges);
+      if (packDir === undefined) {
+        logger.warning(
+          "Cannot create diff range extension pack for diff-informed queries; " +
+            "reverting to performing full analysis.",
+        );
+      } else {
+        logger.info(
+          `Successfully created diff range extension pack at ${packDir}.`,
+        );
+      }
+      return packDir;
+    },
+  );
+}
+
+/**
+ * Return the file line ranges that were added or modified in the pull request.
+ *
+ * @param baseRef The base branch name, used for calculating the diff range.
+ * @param headLabel The label that uniquely identifies the head branch across
+ * repositories, used for calculating the diff range.
+ * @param logger
+ * @returns An array of tuples, where each tuple contains the absolute path of a
+ * file, the start line and the end line (both 1-based and inclusive) of an
+ * added or modified range in that file. Returns `undefined` if the action was
+ * not triggered by a pull request or if there was an error.
+ */
+async function getPullRequestEditedDiffRanges(
+  baseRef: string,
+  headLabel: string,
+  logger: Logger,
+): Promise<DiffThunkRange[] | undefined> {
+  const fileDiffs = await getFileDiffsWithBasehead(baseRef, headLabel, logger);
+  if (fileDiffs === undefined) {
+    return undefined;
+  }
+  if (fileDiffs.length >= 300) {
+    // The "compare two commits" API returns a maximum of 300 changed files. If
+    // we see that many changed files, it is possible that there could be more,
+    // with the rest being truncated. In this case, we should not attempt to
+    // compute the diff ranges, as the result would be incomplete.
+    logger.warning(
+      `Cannot retrieve the full diff because there are too many ` +
+        `(${fileDiffs.length}) changed files in the pull request.`,
+    );
+    return undefined;
+  }
+  const results: DiffThunkRange[] = [];
+  for (const filediff of fileDiffs) {
+    const diffRanges = getDiffRanges(filediff, logger);
+    if (diffRanges === undefined) {
+      return undefined;
+    }
+    results.push(...diffRanges);
+  }
+  return results;
+}
+
+/**
+ * This interface is an abbreviated version of the file diff object returned by
+ * the GitHub API.
+ */
+interface FileDiff {
+  filename: string;
+  changes: number;
+  // A patch may be absent if the file is binary, if the file diff is too large,
+  // or if the file is unchanged.
+  patch?: string | undefined;
+}
+
+async function getFileDiffsWithBasehead(
+  baseRef: string,
+  headLabel: string,
+  logger: Logger,
+): Promise<FileDiff[] | undefined> {
+  const ownerRepo = util.getRequiredEnvParam("GITHUB_REPOSITORY").split("/");
+  const owner = ownerRepo[0];
+  const repo = ownerRepo[1];
+  const basehead = `${baseRef}...${headLabel}`;
+  try {
+    const response = await getApiClient().rest.repos.compareCommitsWithBasehead(
+      {
+        owner,
+        repo,
+        basehead,
+        per_page: 1,
+      },
+    );
+    logger.debug(
+      `Response from compareCommitsWithBasehead(${basehead}):` +
+        `\n${JSON.stringify(response, null, 2)}`,
+    );
+    return response.data.files;
+  } catch (error: any) {
+    if (error.status) {
+      logger.warning(`Error retrieving diff ${basehead}: ${error.message}`);
+      logger.debug(
+        `Error running compareCommitsWithBasehead(${basehead}):` +
+          `\nRequest: ${JSON.stringify(error.request, null, 2)}` +
+          `\nError Response: ${JSON.stringify(error.response, null, 2)}`,
+      );
+      return undefined;
+    } else {
+      throw error;
+    }
+  }
+}
+
+function getDiffRanges(
+  fileDiff: FileDiff,
+  logger: Logger,
+): DiffThunkRange[] | undefined {
+  // Diff-informed queries expect the file path to be absolute. CodeQL always
+  // uses forward slashes as the path separator, so on Windows we need to
+  // replace any backslashes with forward slashes.
+  const filename = path
+    .join(actionsUtil.getRequiredInput("checkout_path"), fileDiff.filename)
+    .replaceAll(path.sep, "/");
+
+  if (fileDiff.patch === undefined) {
+    if (fileDiff.changes === 0) {
+      // There are situations where a changed file legitimately has no diff.
+      // For example, the file may be a binary file, or that the file may have
+      // been renamed with no changes to its contents. In these cases, the
+      // file would be reported as having 0 changes, and we can return an empty
+      // array to indicate no diff range in this file.
+      return [];
+    }
+    // If a file is reported to have nonzero changes but no patch, that may be
+    // due to the file diff being too large. In this case, we should fall back
+    // to a special diff range that covers the entire file.
+    return [
+      {
+        path: filename,
+        startLine: 0,
+        endLine: 0,
+      },
+    ];
+  }
+
+  // The 1-based file line number of the current line
+  let currentLine = 0;
+  // The 1-based file line number that starts the current range of added lines
+  let additionRangeStartLine: number | undefined = undefined;
+  const diffRanges: DiffThunkRange[] = [];
+
+  const diffLines = fileDiff.patch.split("\n");
+  // Adding a fake context line at the end ensures that the following loop will
+  // always terminate the last range of added lines.
+  diffLines.push(" ");
+
+  for (const diffLine of diffLines) {
+    if (diffLine.startsWith("-")) {
+      // Ignore deletions completely -- we do not even want to consider them when
+      // calculating consecutive ranges of added lines.
+      continue;
+    }
+    if (diffLine.startsWith("+")) {
+      if (additionRangeStartLine === undefined) {
+        additionRangeStartLine = currentLine;
+      }
+      currentLine++;
+      continue;
+    }
+    if (additionRangeStartLine !== undefined) {
+      // Any line that does not start with a "+" or "-" terminates the current
+      // range of added lines.
+      diffRanges.push({
+        path: filename,
+        startLine: additionRangeStartLine,
+        endLine: currentLine - 1,
+      });
+      additionRangeStartLine = undefined;
+    }
+    if (diffLine.startsWith("@@ ")) {
+      // A new hunk header line resets the current line number.
+      const match = diffLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (match === null) {
+        logger.warning(
+          `Cannot parse diff hunk header for ${fileDiff.filename}: ${diffLine}`,
+        );
+        return undefined;
+      }
+      currentLine = parseInt(match[1], 10);
+      continue;
+    }
+    if (diffLine.startsWith(" ")) {
+      // An unchanged context line advances the current line number.
+      currentLine++;
+      continue;
+    }
+  }
+  return diffRanges;
+}
+
+/**
+ * Create an extension pack in the temporary directory that contains the file
+ * line ranges that were added or modified in the pull request.
+ *
+ * @param logger
+ * @param ranges The file line ranges, as returned by
+ * `getPullRequestEditedDiffRanges`.
+ * @returns The absolute path of the directory containing the extension pack, or
+ * `undefined` if no extension pack was created.
+ */
+function writeDiffRangeDataExtensionPack(
+  logger: Logger,
+  ranges: DiffThunkRange[] | undefined,
+): string | undefined {
+  if (ranges === undefined) {
+    return undefined;
+  }
+
+  const diffRangeDir = path.join(
+    actionsUtil.getTemporaryDirectory(),
+    "pr-diff-range",
+  );
+  fs.mkdirSync(diffRangeDir);
+  fs.writeFileSync(
+    path.join(diffRangeDir, "qlpack.yml"),
+    `
+name: codeql-action/pr-diff-range
+version: 0.0.0
+library: true
+extensionTargets:
+  codeql/util: '*'
+dataExtensions:
+  - pr-diff-range.yml
+`,
+  );
+
+  const header = `
+extensions:
+  - addsTo:
+      pack: codeql/util
+      extensible: restrictAlertsTo
+    data:
+`;
+
+  let data = ranges
+    .map(
+      (range) =>
+        // Using yaml.dump() with `forceQuotes: true` ensures that all special
+        // characters are escaped, and that the path is always rendered as a
+        // quoted string on a single line.
+        `      - [${yaml.dump(range.path, { forceQuotes: true }).trim()}, ` +
+        `${range.startLine}, ${range.endLine}]\n`,
+    )
+    .join("");
+  if (!data) {
+    // Ensure that the data extension is not empty, so that a pull request with
+    // no edited lines would exclude (instead of accepting) all alerts.
+    data = '      - ["", 0, 0]\n';
+  }
+
+  const extensionContents = header + data;
+  const extensionFilePath = path.join(diffRangeDir, "pr-diff-range.yml");
+  fs.writeFileSync(extensionFilePath, extensionContents);
+  logger.debug(
+    `Wrote pr-diff-range extension pack to ${extensionFilePath}:\n${extensionContents}`,
+  );
+
+  // Write the diff ranges to a JSON file, for action-side alert filtering by the
+  // upload-lib module.
+  writeDiffRangesJsonFile(logger, ranges);
+
+  return diffRangeDir;
+}
+
 // Runs queries and creates sarif files in the given folder
 export async function runQueries(
   sarifFolder: string,
   memoryFlag: string,
   addSnippetsFlag: string,
   threadsFlag: string,
+  diffRangePackDir: string | undefined,
   automationDetailsId: string | undefined,
   config: configUtils.Config,
   logger: Logger,
@@ -247,8 +556,19 @@ export async function runQueries(
 ): Promise<QueriesStatusReport> {
   const statusReport: QueriesStatusReport = {};
 
+  statusReport.analysis_is_diff_informed = diffRangePackDir !== undefined;
+  const dataExtensionFlags = diffRangePackDir
+    ? [
+        `--additional-packs=${diffRangePackDir}`,
+        "--extension-packs=codeql-action/pr-diff-range",
+      ]
+    : [];
+  const sarifRunPropertyFlag = diffRangePackDir
+    ? "--sarif-run-property=incrementalMode=diff-informed"
+    : undefined;
+
   const codeql = await getCodeQL(config.codeQLCmd);
-  const queryFlags = [memoryFlag, threadsFlag];
+  const queryFlags = [memoryFlag, threadsFlag, ...dataExtensionFlags];
 
   for (const language of config.languages) {
     try {
@@ -301,20 +621,12 @@ export async function runQueries(
         }
         statusReport["event_reports"].push(perQueryAlertCountEventReport);
       }
-
-      if (
-        !(await util.codeQlVersionAtLeast(
-          codeql,
-          CODEQL_VERSION_ANALYSIS_SUMMARY_V2,
-        ))
-      ) {
-        await runPrintLinesOfCode(language);
-      }
     } catch (e) {
       statusReport.analyze_failure_language = language;
       throw new CodeQLAnalysisError(
         statusReport,
-        `Error running analysis for ${language}: ${util.wrapError(e).message}`,
+        `Error running analysis for ${language}: ${util.getErrorMessage(e)}`,
+        util.wrapError(e),
       );
     }
   }
@@ -335,10 +647,10 @@ export async function runQueries(
       addSnippetsFlag,
       threadsFlag,
       enableDebugLogging ? "-vv" : "-v",
+      sarifRunPropertyFlag,
       automationDetailsId,
       config,
       features,
-      logger,
     );
   }
 
@@ -369,11 +681,6 @@ export async function runQueries(
     }
     return perQueryAlertCounts;
   }
-
-  async function runPrintLinesOfCode(language: Language): Promise<string> {
-    const databasePath = util.getCodeQLDatabasePath(config, language);
-    return await codeql.databasePrintBaseline(databasePath);
-  }
 }
 
 export async function runFinalize(
@@ -382,7 +689,6 @@ export async function runFinalize(
   memoryFlag: string,
   codeql: CodeQL,
   config: configUtils.Config,
-  features: FeatureEnablement,
   logger: Logger,
 ): Promise<DatabaseCreationTimings> {
   try {
@@ -404,7 +710,7 @@ export async function runFinalize(
 
   // If we didn't already end tracing in the autobuild Action, end it now.
   if (process.env[EnvVar.AUTOBUILD_DID_COMPLETE_SUCCESSFULLY] !== "true") {
-    await endTracingForCluster(codeql, config, logger, features);
+    await endTracingForCluster(codeql, config, logger);
   }
   return timings;
 }
@@ -425,7 +731,7 @@ export async function warnIfGoInstalledAfterInit(
     process.env[EnvVar.DID_AUTOBUILD_GOLANG] !== "true" &&
     goInitPath !== undefined
   ) {
-    const goBinaryPath = await safeWhich("go");
+    const goBinaryPath = await io.which("go", true);
 
     if (goInitPath !== goBinaryPath) {
       logger.warning(
@@ -467,3 +773,7 @@ export async function runCleanup(
   }
   logger.endGroup();
 }
+
+export const exportedForTesting = {
+  getDiffRanges,
+};

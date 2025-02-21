@@ -4,9 +4,12 @@ import * as path from "path";
 import { promisify } from "util";
 
 import * as core from "@actions/core";
+import * as exec from "@actions/exec/lib/exec";
+import * as io from "@actions/io";
 import checkDiskSpace from "check-disk-space";
 import del from "del";
 import getFolderSize from "get-folder-size";
+import * as yaml from "js-yaml";
 import * as semver from "semver";
 
 import * as apiCompatibility from "./api-compatibility.json";
@@ -93,6 +96,16 @@ export interface SarifResult {
       };
     };
   }>;
+  relatedLocations?: Array<{
+    physicalLocation: {
+      artifactLocation: {
+        uri: string;
+      };
+      region?: {
+        startLine?: number;
+      };
+    };
+  }>;
   partialFingerprints: {
     primaryLocationLineHash?: string;
   };
@@ -120,7 +133,7 @@ export function getExtraOptionsEnvParam(): object {
     return {};
   }
   try {
-    return JSON.parse(raw);
+    return yaml.load(raw) as object;
   } catch (unwrappedError) {
     const error = wrapError(unwrappedError);
     throw new ConfigurationError(
@@ -236,7 +249,7 @@ function getTotalMemoryBytes(logger: Logger): number {
       ]
         .map((file) => getCgroupMemoryLimitBytes(file, logger))
         .filter((limit) => limit !== undefined)
-        .map((limit) => limit as number),
+        .map((limit) => limit),
     );
   }
   const limit = Math.min(...limits);
@@ -516,7 +529,7 @@ export function parseGitHubUrl(inputUrl: string): string {
   let url: URL;
   try {
     url = new URL(inputUrl);
-  } catch (e) {
+  } catch {
     throw new ConfigurationError(`"${originalUrl}" is not a valid URL`);
   }
 
@@ -753,7 +766,7 @@ export function doesDirectoryExist(dirPath: string): boolean {
   try {
     const stats = fs.lstatSync(dirPath);
     return stats.isDirectory();
-  } catch (e) {
+  } catch {
     return false;
   }
 }
@@ -783,16 +796,23 @@ export function listFolder(dir: string): string[] {
  *
  * @param cacheDir A directory to get the size of.
  * @param logger A logger to log any errors to.
+ * @param quiet A value indicating whether to suppress warnings for errors (default: false).
+ *              Ignored if the log level is `debug`.
  * @returns The size in bytes of the folder, or undefined if errors occurred.
  */
 export async function tryGetFolderBytes(
   cacheDir: string,
   logger: Logger,
+  quiet: boolean = false,
 ): Promise<number | undefined> {
   try {
     return await promisify<string, number>(getFolderSize)(cacheDir);
   } catch (e) {
-    logger.warning(`Encountered an error while getting size of folder: ${e}`);
+    if (!quiet || logger.isDebug()) {
+      logger.warning(
+        `Encountered an error while getting size of '${cacheDir}': ${e}`,
+      );
+    }
     return undefined;
   }
 }
@@ -888,7 +908,7 @@ export function parseMatrixInput(
   if (matrixInput === undefined || matrixInput === "null") {
     return undefined;
   }
-  return JSON.parse(matrixInput);
+  return JSON.parse(matrixInput) as { [key: string]: string };
 }
 
 function removeDuplicateLocations(locations: SarifLocation[]): SarifLocation[] {
@@ -997,8 +1017,14 @@ export function wrapError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
+/**
+ * Returns an appropriate message for the error.
+ *
+ * If the error is an `Error` instance, this returns the error message without
+ * an `Error: ` prefix.
+ */
 export function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.toString() : String(error);
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function prettyPrintPack(pack: Pack) {
@@ -1013,14 +1039,23 @@ export interface DiskUsage {
 }
 
 export async function checkDiskUsage(
-  logger?: Logger,
+  logger: Logger,
 ): Promise<DiskUsage | undefined> {
   try {
+    // We avoid running the `df` binary under the hood for macOS ARM runners with SIP disabled.
+    if (
+      process.platform === "darwin" &&
+      (process.arch === "arm" || process.arch === "arm64") &&
+      !(await checkSipEnablement(logger))
+    ) {
+      return undefined;
+    }
+
     const diskUsage = await checkDiskSpace(
       getRequiredEnvParam("GITHUB_WORKSPACE"),
     );
     const gbInBytes = 1024 * 1024 * 1024;
-    if (logger && diskUsage.free < 2 * gbInBytes) {
+    if (diskUsage.free < 2 * gbInBytes) {
       const message =
         "The Actions runner is running low on disk space " +
         `(${(diskUsage.free / gbInBytes).toPrecision(4)} GB available).`;
@@ -1036,11 +1071,9 @@ export async function checkDiskUsage(
       numTotalBytes: diskUsage.size,
     };
   } catch (error) {
-    if (logger) {
-      logger.warning(
-        `Failed to check available disk space: ${getErrorMessage(error)}`,
-      );
-    }
+    logger.warning(
+      `Failed to check available disk space: ${getErrorMessage(error)}`,
+    );
     return undefined;
   }
 }
@@ -1048,19 +1081,18 @@ export async function checkDiskUsage(
 /**
  * Prompt the customer to upgrade to CodeQL Action v3, if appropriate.
  *
- * Check whether a customer is running v2. If they are, and we can determine that the GitHub
- * instance supports v3, then log a warning about v2's upcoming deprecation prompting the customer
- * to upgrade to v3.
+ * Check whether a customer is running v1 or v2. If they are, and we can determine that the GitHub
+ * instance supports v3, then log an error prompting the customer to upgrade to v3.
  */
 export function checkActionVersion(
   version: string,
   githubVersion: GitHubVersion,
 ) {
   if (
-    !semver.satisfies(version, ">=3") && // do not warn if the customer is already running v3
-    !process.env.CODEQL_V2_DEPRECATION_WARNING // do not warn if we have already warned
+    !semver.satisfies(version, ">=3") && // do not log error if the customer is already running v3
+    !process.env[EnvVar.LOG_VERSION_DEPRECATION] // do not log error if we have already
   ) {
-    // Only log a warning for versions of GHES that are compatible with CodeQL Action version 3.
+    // Only error for versions of GHES that are compatible with CodeQL Action version 3.
     //
     // GHES 3.11 shipped without the v3 tag, but it also shipped without this warning message code.
     // Therefore users who are seeing this warning message code have pulled in a new version of the
@@ -1074,14 +1106,14 @@ export function checkActionVersion(
           ">=3.11",
         ))
     ) {
-      core.warning(
-        "CodeQL Action v2 will be deprecated on December 5th, 2024. " +
+      core.error(
+        "CodeQL Action major versions v1 and v2 have been deprecated. " +
           "Please update all occurrences of the CodeQL Action in your workflow files to v3. " +
           "For more information, see " +
-          "https://github.blog/changelog/2024-01-12-code-scanning-deprecation-of-codeql-action-v2/",
+          "https://github.blog/changelog/2025-01-10-code-scanning-codeql-action-v2-is-now-deprecated/",
       );
-      // set CODEQL_V2_DEPRECATION_WARNING env var to prevent the warning from being logged multiple times
-      core.exportVariable("CODEQL_V2_DEPRECATION_WARNING", "true");
+      // set LOG_VERSION_DEPRECATION env var to prevent the warning from being logged multiple times
+      core.exportVariable(EnvVar.LOG_VERSION_DEPRECATION, "true");
     }
   }
 }
@@ -1099,4 +1131,83 @@ export enum BuildMode {
   Autobuild = "autobuild",
   /** The database will be created by building the source root using manually specified build steps. */
   Manual = "manual",
+}
+
+export function cloneObject<T>(obj: T): T {
+  return JSON.parse(JSON.stringify(obj)) as T;
+}
+
+// The first time this function is called, it runs `csrutil status` to determine
+// whether System Integrity Protection is enabled; and saves the result in an
+// environment variable. Afterwards, simply return the value of the environment
+// variable.
+export async function checkSipEnablement(
+  logger: Logger,
+): Promise<boolean | undefined> {
+  if (
+    process.env[EnvVar.IS_SIP_ENABLED] !== undefined &&
+    ["true", "false"].includes(process.env[EnvVar.IS_SIP_ENABLED])
+  ) {
+    return process.env[EnvVar.IS_SIP_ENABLED] === "true";
+  }
+
+  try {
+    const sipStatusOutput = await exec.getExecOutput("csrutil status");
+    if (sipStatusOutput.exitCode === 0) {
+      if (
+        sipStatusOutput.stdout.includes(
+          "System Integrity Protection status: enabled.",
+        )
+      ) {
+        core.exportVariable(EnvVar.IS_SIP_ENABLED, "true");
+        return true;
+      }
+      if (
+        sipStatusOutput.stdout.includes(
+          "System Integrity Protection status: disabled.",
+        )
+      ) {
+        core.exportVariable(EnvVar.IS_SIP_ENABLED, "false");
+        return false;
+      }
+    }
+    return undefined;
+  } catch (e) {
+    logger.warning(
+      `Failed to determine if System Integrity Protection was enabled: ${e}`,
+    );
+    return undefined;
+  }
+}
+
+export async function cleanUpGlob(glob: string, name: string, logger: Logger) {
+  logger.debug(`Cleaning up ${name}.`);
+  try {
+    const deletedPaths = await del(glob, { force: true });
+    if (deletedPaths.length === 0) {
+      logger.warning(
+        `Failed to clean up ${name}: no files found matching ${glob}.`,
+      );
+    } else if (deletedPaths.length === 1) {
+      logger.debug(`Cleaned up ${name}.`);
+    } else {
+      logger.debug(`Cleaned up ${name} (${deletedPaths.length} files).`);
+    }
+  } catch (e) {
+    logger.warning(`Failed to clean up ${name}: ${e}.`);
+  }
+}
+
+export async function isBinaryAccessible(
+  binary: string,
+  logger: Logger,
+): Promise<boolean> {
+  try {
+    await io.which(binary, true);
+    logger.debug(`Found ${binary}.`);
+    return true;
+  } catch (e) {
+    logger.debug(`Could not find ${binary}: ${e}`);
+    return false;
+  }
 }

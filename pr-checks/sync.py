@@ -4,28 +4,35 @@ import ruamel.yaml
 from ruamel.yaml.scalarstring import FoldedScalarString, SingleQuotedScalarString
 import pathlib
 import textwrap
+import os
 
 # The default set of CodeQL Bundle versions to use for the PR checks.
 defaultTestVersions = [
-    # The oldest supported CodeQL version: 2.12.6. If bumping, update `CODEQL_MINIMUM_VERSION` in `codeql.ts`
-    "stable-20230403",
-    # The last CodeQL release in the 2.13 series: 2.13.5.
-    "stable-v2.13.5",
-    # The last CodeQL release in the 2.14 series: 2.14.6.
-    "stable-v2.14.6",
-    # The last CodeQL release in the 2.15 series: 2.15.5.
+    # The oldest supported CodeQL version. If bumping, update `CODEQL_MINIMUM_VERSION` in `codeql.ts`
     "stable-v2.15.5",
-    # The last CodeQL release in the 2.16 series: 2.16.6.
+    # The last CodeQL release in the 2.16 series.
     "stable-v2.16.6",
+    # The last CodeQL release in the 2.17 series.
+    "stable-v2.17.6",
+    # The last CodeQL release in the 2.18 series.
+    "stable-v2.18.4",
+    # The last CodeQL release in the 2.19 series.
+    "stable-v2.19.4",
     # The default version of CodeQL for Dotcom, as determined by feature flags.
     "default",
     # The version of CodeQL shipped with the Action in `defaults.json`. During the release process
     # for a new CodeQL release, there will be a period of time during which this will be newer than
     # the default version on Dotcom.
-    "latest",
+    "linked",
     # A nightly build directly from the our private repo, built in the last 24 hours.
     "nightly-latest"
 ]
+
+def is_os_and_version_excluded(os, version, exclude_params):
+    for exclude_param in exclude_params:
+        if exclude_param[0] == os and exclude_param[1] == version:
+            return True
+    return False
 
 # When updating the ruamel.yaml version here, update the PR check in
 # `.github/workflows/pr-checks.yml` too.
@@ -56,23 +63,23 @@ allJobs = {}
 for file in (this_dir / 'checks').glob('*.yml'):
     with open(file, 'r') as checkStream:
         checkSpecification = yaml.load(checkStream)
-
     matrix = []
+    excludedOsesAndVersions = checkSpecification.get('excludeOsAndVersionCombination', [])
     for version in checkSpecification.get('versions', defaultTestVersions):
-        runnerImages = ["ubuntu-latest", "macos-latest", "windows-latest"]
-        if checkSpecification.get('operatingSystems', None):
-            runnerImages = [image for image in runnerImages for operatingSystem in checkSpecification['operatingSystems']
-                            if image.startswith(operatingSystem)]
+        if version == "latest":
+            raise ValueError('Did not recognize "version: latest". Did you mean "version: linked"?')
 
-        for runnerImage in runnerImages:
-            # Prior to CLI v2.15.1, ARM runners were not supported by the build tracer.
-            # "macos-latest" is now an ARM runner, so we run tests on the old CLIs on Intel runners instead.
-            if version in ["stable-20230403", "stable-v2.13.4", "stable-v2.13.5", "stable-v2.14.6"] and runnerImage == "macos-latest":
-                matrix.append({
-                    'os': "macos-12",
-                    'version': version
-                })
-            else:     
+        runnerImages = ["ubuntu-latest", "macos-latest", "windows-latest"]
+        operatingSystems = checkSpecification.get('operatingSystems', ["ubuntu", "macos", "windows"])
+
+        for operatingSystem in operatingSystems:
+            runnerImagesForOs = [image for image in runnerImages if image.startswith(operatingSystem)]
+
+            for runnerImage in runnerImagesForOs:
+                # Skip appending this combination to the matrix if it is explicitly excluded.
+                if is_os_and_version_excluded(operatingSystem, version, excludedOsesAndVersions):
+                    continue
+
                 matrix.append({
                     'os': runnerImage,
                     'version': version
@@ -84,21 +91,6 @@ for file in (this_dir / 'checks').glob('*.yml'):
 
     steps = [
         {
-            'name': 'Setup Python on MacOS',
-            'uses': 'actions/setup-python@v5',
-            # Ensure that this is serialized as a folded (`>`) string to preserve the readability
-            # of the generated workflow.
-            'if': FoldedScalarString(textwrap.dedent('''
-                    runner.os == 'macOS' && (
-                    matrix.version == 'stable-20230403' ||
-                    matrix.version == 'stable-v2.13.5' ||
-                    matrix.version == 'stable-v2.14.6')
-            ''').strip()),
-            'with': {
-                'python-version': '3.11'
-            }
-        },
-        {
             'name': 'Check out repository',
             'uses': 'actions/checkout@v4'
         },
@@ -108,10 +100,19 @@ for file in (this_dir / 'checks').glob('*.yml'):
             'uses': './.github/actions/prepare-test',
             'with': {
                 'version': '${{ matrix.version }}',
-                'use-all-platform-bundle': useAllPlatformBundle
+                'use-all-platform-bundle': useAllPlatformBundle,
+                # If the action is being run from a container, then do not setup kotlin.
+                # This is because the kotlin binaries cannot be downloaded from the container.
+                'setup-kotlin': str(not 'container' in checkSpecification).lower(),
             }
         },
     ]
+
+    # If container initialisation steps are present in the check specification,
+    # make sure to execute them first.
+    if 'container' in checkSpecification and 'container-init-steps' in checkSpecification:
+        steps.insert(0, checkSpecification['container-init-steps'])
+
 
     steps.extend(checkSpecification['steps'])
 
@@ -125,7 +126,7 @@ for file in (this_dir / 'checks').glob('*.yml'):
         'name': checkSpecification['name'],
         'permissions': {
             'contents': 'read',
-            'security-events': 'write'
+            'security-events': 'read'
         },
         'timeout-minutes': 45,
         'runs-on': '${{ matrix.os }}',
@@ -143,16 +144,14 @@ for file in (this_dir / 'checks').glob('*.yml'):
         checkJob['env']['CODEQL_ACTION_TEST_MODE'] = True
     checkName = file.stem
 
-    with open(this_dir.parent / ".github" / "workflows" / f"__{checkName}.yml", 'w') as output_stream:
+    raw_file = this_dir.parent / ".github" / "workflows" / f"__{checkName}.yml.raw"
+    with open(raw_file, 'w') as output_stream:
         writeHeader(output_stream)
         yaml.dump({
             'name': f"PR Check - {checkSpecification['name']}",
             'env': {
                 'GITHUB_TOKEN': '${{ secrets.GITHUB_TOKEN }}',
-                'GO111MODULE': 'auto',
-                # Disable Kotlin analysis while it's incompatible with Kotlin 1.8, until we find a
-                # workaround for our PR checks.
-                'CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN': 'true',
+                'GO111MODULE': 'auto'
             },
             'on': {
                 'push': {
@@ -168,3 +167,9 @@ for file in (this_dir / 'checks').glob('*.yml'):
                 checkName: checkJob
             }
         }, output_stream)
+
+    with open(raw_file, 'r') as input_stream:
+        with open(this_dir.parent / ".github" / "workflows" / f"__{checkName}.yml", 'w') as output_stream:
+            content = input_stream.read()
+            output_stream.write("\n".join(list(map(lambda x:x.rstrip(), content.splitlines()))+['']))
+    os.remove(raw_file)

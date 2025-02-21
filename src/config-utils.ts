@@ -6,14 +6,14 @@ import * as yaml from "js-yaml";
 import * as semver from "semver";
 
 import * as api from "./api-client";
-import { CodeQL, CODEQL_VERSION_LANGUAGE_ALIASING } from "./codeql";
+import { CachingKind, getCachingKind } from "./caching-utils";
+import { CodeQL } from "./codeql";
 import { Feature, FeatureEnablement } from "./feature-flags";
 import { Language, parseLanguage } from "./languages";
 import { Logger } from "./logging";
 import { RepositoryNwo } from "./repository";
 import { downloadTrapCaches } from "./trap-caching";
 import {
-  codeQlVersionAtLeast,
   GitHubVersion,
   prettyPrintPack,
   ConfigurationError,
@@ -64,6 +64,12 @@ export interface RegistryConfigNoCredentials {
 
   // List of globs that determine which packs are associated with this registry.
   packages: string[] | string;
+
+  // Kind of registry, either "github" or "docker". Default is "docker".
+  // "docker" refers specifically to the GitHub Container Registry, which is the usual way of sharing CodeQL packs.
+  // "github" refers to packs published as content in a GitHub repository. This kind of registry is used in scenarios
+  // where GHCR is not available, such as certain GHES environments.
+  kind?: "github" | "docker";
 }
 
 interface ExcludeQueryFilter {
@@ -137,6 +143,9 @@ export interface Config {
    * Time taken to download TRAP caches. Used for status reporting.
    */
   trapCacheDownloadTime: number;
+
+  /** A value indicating how dependency caching should be used. */
+  dependencyCachingEnabled: CachingKind;
 }
 
 /**
@@ -317,7 +326,7 @@ export async function getLanguages(
 
     logger.info(`Automatically detected languages: ${languages.join(", ")}`);
   } else {
-    const aliases = await getLanguageAliases(codeQL);
+    const aliases = (await codeQL.betterResolveLanguages()).aliases;
     if (aliases) {
       languages = languages.map((lang) => aliases[lang] || lang);
     }
@@ -350,19 +359,6 @@ export async function getLanguages(
   }
 
   return parsedLanguages;
-}
-
-/**
- * Gets the set of languages supported by CodeQL, along with their aliases if supported by the
- * version of the CLI.
- */
-export async function getLanguageAliases(
-  codeql: CodeQL,
-): Promise<{ [alias: string]: string } | undefined> {
-  if (await codeQlVersionAtLeast(codeql, CODEQL_VERSION_LANGUAGE_ALIASING)) {
-    return (await codeql.betterResolveLanguages()).aliases;
-  }
-  return undefined;
 }
 
 /**
@@ -407,6 +403,7 @@ export interface InitConfigInputs {
   configInput: string | undefined;
   buildModeInput: string | undefined;
   trapCachingEnabled: boolean;
+  dependencyCachingEnabled: string | undefined;
   debugMode: boolean;
   debugArtifactName: string;
   debugDatabaseName: string;
@@ -439,6 +436,7 @@ export async function getDefaultConfig({
   buildModeInput,
   dbLocation,
   trapCachingEnabled,
+  dependencyCachingEnabled,
   debugMode,
   debugArtifactName,
   debugDatabaseName,
@@ -490,6 +488,7 @@ export async function getDefaultConfig({
     augmentationProperties,
     trapCaches,
     trapCacheDownloadTime,
+    dependencyCachingEnabled: getCachingKind(dependencyCachingEnabled),
   };
 }
 
@@ -523,6 +522,7 @@ async function loadConfig({
   configFile,
   dbLocation,
   trapCachingEnabled,
+  dependencyCachingEnabled,
   debugMode,
   debugArtifactName,
   debugDatabaseName,
@@ -594,6 +594,7 @@ async function loadConfig({
     augmentationProperties,
     trapCaches,
     trapCacheDownloadTime,
+    dependencyCachingEnabled: getCachingKind(dependencyCachingEnabled),
   };
 }
 
@@ -651,7 +652,7 @@ function parseQueriesFromInput(
 
   const trimmedInput = queriesInputCombines
     ? rawQueriesInput.trim().slice(1).trim()
-    : rawQueriesInput?.trim() ?? "";
+    : (rawQueriesInput?.trim() ?? "");
   if (queriesInputCombines && trimmedInput.length === 0) {
     throw new ConfigurationError(
       getConfigFilePropertyError(
@@ -770,7 +771,7 @@ export function parsePacksSpecification(packStr: string): Pack {
   if (version) {
     try {
       new semver.Range(version);
-    } catch (e) {
+    } catch {
       // The range string is invalid. OK to ignore the caught error
       throw new ConfigurationError(getPacksStrInvalid(packStr));
     }
@@ -874,11 +875,20 @@ function parseRegistries(
     return registriesInput
       ? (yaml.load(registriesInput) as RegistryConfigWithCredentials[])
       : undefined;
-  } catch (e) {
+  } catch {
     throw new ConfigurationError(
       "Invalid registries input. Must be a YAML string.",
     );
   }
+}
+
+export function parseRegistriesWithoutCredentials(
+  registriesInput?: string,
+): RegistryConfigNoCredentials[] | undefined {
+  return parseRegistries(registriesInput)?.map((r) => {
+    const { url, packages, kind } = r;
+    return { url, packages, kind };
+  });
 }
 
 function isLocal(configPath: string): boolean {
@@ -976,7 +986,7 @@ export async function getConfig(
   const configString = fs.readFileSync(configFile, "utf8");
   logger.debug("Loaded config:");
   logger.debug(configString);
-  return JSON.parse(configString);
+  return JSON.parse(configString) as Config;
 }
 
 /**
@@ -1044,6 +1054,7 @@ function createRegistriesBlock(registries: RegistryConfigWithCredentials[]): {
     // ensure the url ends with a slash to avoid a bug in the CLI 2.10.4
     url: !registry?.url.endsWith("/") ? `${registry.url}/` : registry.url,
     packages: registry.packages,
+    kind: registry.kind,
   }));
   const qlconfig = {
     registries: safeRegistries,
@@ -1065,7 +1076,7 @@ function createRegistriesBlock(registries: RegistryConfigWithCredentials[]): {
  */
 export async function wrapEnvironment(
   env: Record<string, string | undefined>,
-  operation: Function,
+  operation: () => Promise<void>,
 ) {
   // Remember the original env
   const oldEnv = { ...process.env };
@@ -1106,6 +1117,16 @@ export async function parseBuildModeInput(
         BuildMode,
       ).join(", ")}.`,
     );
+  }
+
+  if (
+    languages.includes(Language.csharp) &&
+    (await features.getValue(Feature.DisableCsharpBuildless))
+  ) {
+    logger.warning(
+      "Scanning C# code without a build is temporarily unavailable. Falling back to 'autobuild' build mode.",
+    );
+    return BuildMode.Autobuild;
   }
 
   if (

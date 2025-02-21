@@ -1,3 +1,5 @@
+import * as fs from "fs";
+
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 
@@ -92,20 +94,15 @@ async function maybeUploadFailedSarif(
     await codeql.diagnosticsExport(sarifFile, category, config);
   } else {
     // We call 'database export-diagnostics' to find any per-database diagnostics.
-    await codeql.databaseExportDiagnostics(
-      databasePath,
-      sarifFile,
-      category,
-      config.tempDir,
-      logger,
-    );
+    await codeql.databaseExportDiagnostics(databasePath, sarifFile, category);
   }
 
   logger.info(`Uploading failed SARIF file ${sarifFile}`);
-  const uploadResult = await uploadLib.uploadFromActions(
+  const uploadResult = await uploadLib.uploadFiles(
     sarifFile,
     checkoutPath,
     category,
+    features,
     logger,
   );
   await uploadLib.waitForProcessing(
@@ -161,9 +158,12 @@ export async function tryUploadSarifIfRunFailed(
 }
 
 export async function run(
-  uploadDatabaseBundleDebugArtifact: Function,
-  uploadLogsDebugArtifact: Function,
-  printDebugLogs: Function,
+  uploadAllAvailableDebugArtifacts: (
+    config: Config,
+    logger: Logger,
+    codeQlVersion: string,
+  ) => Promise<void>,
+  printDebugLogs: (config: Config) => Promise<void>,
   config: Config,
   repositoryNwo: RepositoryNwo,
   features: FeatureEnablement,
@@ -211,10 +211,32 @@ export async function run(
     logger.info(
       "Debug mode is on. Uploading available database bundles and logs as Actions debugging artifacts...",
     );
-    await uploadDatabaseBundleDebugArtifact(config, logger);
-    await uploadLogsDebugArtifact(config);
-
+    const codeql = await getCodeQL(config.codeQLCmd);
+    const version = await codeql.getVersion();
+    await uploadAllAvailableDebugArtifacts(config, logger, version.version);
     await printDebugLogs(config);
+  }
+
+  if (actionsUtil.isSelfHostedRunner()) {
+    try {
+      fs.rmSync(config.dbLocation, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+      });
+      logger.info(
+        `Cleaned up database cluster directory ${config.dbLocation}.`,
+      );
+    } catch (e) {
+      logger.warning(
+        `Failed to clean up database cluster directory ${config.dbLocation}. Details: ${e}`,
+      );
+    }
+  } else {
+    logger.debug(
+      "Skipping cleanup of database cluster directory since we are running on a GitHub-hosted " +
+        "runner which will be automatically cleaned up.",
+    );
   }
 
   return uploadFailedSarifResult;

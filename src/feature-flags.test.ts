@@ -60,6 +60,36 @@ test(`All features are disabled if running against GHES`, async (t) => {
   });
 });
 
+test(`Feature flags are requested in Proxima`, async (t) => {
+  await withTmpDir(async (tmpDir) => {
+    const loggedMessages = [];
+    const features = setUpFeatureFlagTests(
+      tmpDir,
+      getRecordingLogger(loggedMessages),
+      { type: GitHubVariant.GHE_DOTCOM },
+    );
+
+    mockFeatureFlagApiEndpoint(200, initializeFeatures(true));
+
+    for (const feature of Object.values(Feature)) {
+      // Ensure we have gotten a response value back from the Mock API
+      t.assert(
+        await features.getValue(feature, includeCodeQlIfRequired(feature)),
+      );
+    }
+
+    // And that we haven't bailed preemptively.
+    t.assert(
+      loggedMessages.find(
+        (v: LoggedMessage) =>
+          v.type === "debug" &&
+          v.message ===
+            "Not running against github.com. Disabling all toggleable features.",
+      ) === undefined,
+    );
+  });
+});
+
 test("API response missing and features use default value", async (t) => {
   await withTmpDir(async (tmpDir) => {
     const loggedMessages: LoggedMessage[] = [];
@@ -285,30 +315,6 @@ for (const feature of Object.keys(featureConfig)) {
   }
 }
 
-// If we ever run into a situation where we no longer have any features that
-// specify a minimum version or required tools feature, then we will have a
-// bunch of code no longer being tested. This is unlikely, and this test will
-// fail if that happens.
-// If we do end up in that situation, then we should consider adding a synthetic
-// feature with a minimum version that is only used for tests.
-test("At least one feature has a minimum version specified", (t) => {
-  t.assert(
-    Object.values(featureConfig).some((f) => f.minimumVersion !== undefined),
-    "At least one feature should have a minimum version specified",
-  );
-
-  t.assert(
-    Object.values(featureConfig).some((f) => f.toolsFeature !== undefined),
-    "At least one feature should have a required tools feature specified",
-  );
-
-  // An even less likely scenario is that we no longer have any features.
-  t.assert(
-    Object.values(featureConfig).length > 0,
-    "There should be at least one feature",
-  );
-});
-
 test("Feature flags are saved to disk", async (t) => {
   await withTmpDir(async (tmpDir) => {
     const features = setUpFeatureFlagTests(tmpDir);
@@ -428,7 +434,7 @@ test("selects CLI v2.20.1 on Dotcom when feature flags enable v2.20.0 and v2.20.
   });
 });
 
-test("includes tag name when feature flags enable version greater than v2.13.4", async (t) => {
+test("includes tag name", async (t) => {
   await withTmpDir(async (tmpDir) => {
     const features = setUpFeatureFlagTests(tmpDir);
     const expectedFeatureEnablement = initializeFeatures(true);
@@ -450,25 +456,6 @@ test(`selects CLI from defaults.json on Dotcom when no default version feature f
   await withTmpDir(async (tmpDir) => {
     const features = setUpFeatureFlagTests(tmpDir);
     const expectedFeatureEnablement = initializeFeatures(true);
-    mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
-
-    const defaultCliVersion = await features.getDefaultCliVersion(
-      GitHubVariant.DOTCOM,
-    );
-    t.deepEqual(defaultCliVersion, {
-      cliVersion: defaults.cliVersion,
-      tagName: defaults.bundleVersion,
-      toolsFeatureFlagsValid: false,
-    });
-  });
-});
-
-test(`selects CLI from defaults.json on Dotcom when default version feature flags are unsupported`, async (t) => {
-  await withTmpDir(async (tmpDir) => {
-    const features = setUpFeatureFlagTests(tmpDir);
-    const expectedFeatureEnablement = initializeFeatures(true);
-    // Doesn't have a semantically versioned bundle
-    expectedFeatureEnablement["default_codeql_version_2_13_3_enabled"] = true;
     mockFeatureFlagApiEndpoint(200, expectedFeatureEnablement);
 
     const defaultCliVersion = await features.getDefaultCliVersion(
@@ -538,6 +525,17 @@ test("non-legacy feature flags should not end with _enabled", async (t) => {
   }
 });
 
+test("non-legacy feature flags should not start with codeql_action_", async (t) => {
+  for (const [feature, config] of Object.entries(featureConfig)) {
+    if (!config.legacyApi) {
+      t.false(
+        feature.startsWith("codeql_action_"),
+        `non-legacy feature ${feature} should not start with 'codeql_action_'`,
+      );
+    }
+  }
+});
+
 function assertAllFeaturesUndefinedInApi(
   t: ExecutionContext<unknown>,
   loggedMessages: LoggedMessage[],
@@ -554,7 +552,7 @@ function assertAllFeaturesUndefinedInApi(
   }
 }
 
-function initializeFeatures(initialValue: boolean) {
+export function initializeFeatures(initialValue: boolean) {
   return Object.keys(featureConfig).reduce((features, key) => {
     features[key] = initialValue;
     return features;

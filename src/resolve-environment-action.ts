@@ -7,7 +7,7 @@ import {
   getTemporaryDirectory,
 } from "./actions-util";
 import { getGitHubVersion } from "./api-client";
-import { CommandInvocationError } from "./cli-errors";
+import { CliError } from "./cli-errors";
 import { Config, getConfig } from "./config-utils";
 import { getActionsLogger } from "./logging";
 import { runResolveBuildEnvironment } from "./resolve-environment";
@@ -22,6 +22,7 @@ import {
   checkDiskUsage,
   checkForTimeout,
   checkGitHubVersionInRange,
+  getErrorMessage,
   wrapError,
 } from "./util";
 
@@ -39,7 +40,7 @@ async function run() {
       "starting",
       startedAt,
       config,
-      await checkDiskUsage(),
+      await checkDiskUsage(logger),
       logger,
     );
     if (statusReportBase !== undefined) {
@@ -68,7 +69,7 @@ async function run() {
   } catch (unwrappedError) {
     const error = wrapError(unwrappedError);
 
-    if (error instanceof CommandInvocationError) {
+    if (error instanceof CliError) {
       // If the CLI failed to run successfully for whatever reason,
       // we just return an empty JSON object and proceed with the workflow.
       core.setOutput(ENVIRONMENT_OUTPUT_NAME, {});
@@ -86,7 +87,7 @@ async function run() {
         getActionsStatus(error),
         startedAt,
         config,
-        await checkDiskUsage(),
+        await checkDiskUsage(logger),
         logger,
         error.message,
         error.stack,
@@ -104,7 +105,7 @@ async function run() {
     "success",
     startedAt,
     config,
-    await checkDiskUsage(),
+    await checkDiskUsage(logger),
     logger,
   );
   if (statusReportBase !== undefined) {
@@ -117,9 +118,9 @@ async function runWrapper() {
     await run();
   } catch (error) {
     core.setFailed(
-      `${ActionName.ResolveEnvironment} action failed: ${
-        wrapError(error).message
-      }`,
+      `${ActionName.ResolveEnvironment} action failed: ${getErrorMessage(
+        error,
+      )}`,
     );
   }
   await checkForTimeout();

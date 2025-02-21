@@ -1,20 +1,20 @@
+import {
+  CommandInvocationError,
+  ensureEndsInPeriod,
+  prettyPrintInvocation,
+} from "./actions-util";
+import { DocUrl } from "./doc-url";
 import { ConfigurationError } from "./util";
 
 /**
- * A class of Error that we can classify as an error stemming from a CLI
- * invocation, with associated exit code, stderr,etc.
+ * An error from a CodeQL CLI invocation, with associated exit code, stderr, etc.
  */
-export class CommandInvocationError extends Error {
-  constructor(
-    cmd: string,
-    args: string[],
-    public exitCode: number,
-    public stderr: string,
-    public stdout: string,
-  ) {
-    const prettyCommand = [cmd, ...args]
-      .map((x) => (x.includes(" ") ? `'${x}'` : x))
-      .join(" ");
+export class CliError extends Error {
+  public readonly exitCode: number | undefined;
+  public readonly stderr: string;
+
+  constructor({ cmd, args, exitCode, stderr }: CommandInvocationError) {
+    const prettyCommand = prettyPrintInvocation(cmd, args);
 
     const fatalErrors = extractFatalErrors(stderr);
     const autobuildErrors = extractAutobuildErrors(stderr);
@@ -23,25 +23,26 @@ export class CommandInvocationError extends Error {
     if (fatalErrors) {
       message =
         `Encountered a fatal error while running "${prettyCommand}". ` +
-        `Exit code was ${exitCode} and error was: ${fatalErrors.trim()} See the logs for more details.`;
+        `Exit code was ${exitCode} and error was: ${ensureEndsInPeriod(
+          fatalErrors.trim(),
+        )} See the logs for more details.`;
     } else if (autobuildErrors) {
-      const autobuildHelpLink =
-        "https://docs.github.com/en/code-security/code-scanning/troubleshooting-code-scanning/automatic-build-failed";
       message =
         "We were unable to automatically build your code. Please provide manual build steps. " +
-        `For more information, see ${autobuildHelpLink}. ` +
+        `See ${DocUrl.AUTOMATIC_BUILD_FAILED} for more information. ` +
         `Encountered the following error: ${autobuildErrors}`;
     } else {
-      let lastLine = stderr.trim().split("\n").pop()?.trim() || "";
-      if (lastLine[lastLine.length - 1] !== ".") {
-        lastLine += ".";
-      }
+      const lastLine = ensureEndsInPeriod(
+        stderr.trim().split("\n").pop()?.trim() || "n/a",
+      );
       message =
         `Encountered a fatal error while running "${prettyCommand}". ` +
         `Exit code was ${exitCode} and last log line was: ${lastLine} See the logs for more details.`;
     }
 
     super(message);
+    this.exitCode = exitCode;
+    this.stderr = stderr;
   }
 }
 
@@ -75,7 +76,7 @@ export class CommandInvocationError extends Error {
  * the Actions UI.
  */
 function extractFatalErrors(error: string): string | undefined {
-  const fatalErrorRegex = /.*fatal error occurred:/gi;
+  const fatalErrorRegex = /.*fatal (internal )?error occurr?ed(. Details)?:/gi;
   let fatalErrors: string[] = [];
   let lastFatalErrorIndex: number | undefined;
   let match: RegExpMatchArray | null;
@@ -115,17 +116,15 @@ function extractAutobuildErrors(error: string): string | undefined {
   return errorLines.join("\n") || undefined;
 }
 
-function ensureEndsInPeriod(text: string): string {
-  return text[text.length - 1] === "." ? text : `${text}.`;
-}
-
 /** Error messages from the CLI that we consider configuration errors and handle specially. */
 export enum CliConfigErrorCategory {
+  AutobuildError = "AutobuildError",
   ExternalRepositoryCloneFailed = "ExternalRepositoryCloneFailed",
   GradleBuildFailed = "GradleBuildFailed",
   IncompatibleWithActionVersion = "IncompatibleWithActionVersion",
   InitCalledTwice = "InitCalledTwice",
   InvalidConfigFile = "InvalidConfigFile",
+  InvalidExternalRepoSpecifier = "InvalidExternalRepoSpecifier",
   InvalidSourceRoot = "InvalidSourceRoot",
   MavenBuildFailed = "MavenBuildFailed",
   NoBuildCommandAutodetected = "NoBuildCommandAutodetected",
@@ -135,6 +134,7 @@ export enum CliConfigErrorCategory {
   NoSupportedBuildSystemDetected = "NoSupportedBuildSystemDetected",
   OutOfMemoryOrDisk = "OutOfMemoryOrDisk",
   PackCannotBeFound = "PackCannotBeFound",
+  PackMissingAuth = "PackMissingAuth",
   SwiftBuildFailed = "SwiftBuildFailed",
   UnsupportedBuildMode = "UnsupportedBuildMode",
 }
@@ -154,6 +154,11 @@ export const cliErrorsConfig: Record<
   CliConfigErrorCategory,
   CliErrorConfiguration
 > = {
+  [CliConfigErrorCategory.AutobuildError]: {
+    cliErrorMessageCandidates: [
+      new RegExp("We were unable to automatically build your code"),
+    ],
+  },
   [CliConfigErrorCategory.ExternalRepositoryCloneFailed]: {
     cliErrorMessageCandidates: [
       new RegExp("Failed to clone external Git repository"),
@@ -182,6 +187,11 @@ export const cliErrorsConfig: Record<
     cliErrorMessageCandidates: [
       new RegExp("Config file .* is not valid"),
       new RegExp("The supplied config file is empty"),
+    ],
+  },
+  [CliConfigErrorCategory.InvalidExternalRepoSpecifier]: {
+    cliErrorMessageCandidates: [
+      new RegExp("Specifier for external repository is invalid"),
     ],
   },
   // Expected source location for database creation does not exist
@@ -244,6 +254,14 @@ export const cliErrorsConfig: Record<
       ),
     ],
   },
+  [CliConfigErrorCategory.PackMissingAuth]: {
+    cliErrorMessageCandidates: [
+      new RegExp("GitHub Container registry .* 403 Forbidden"),
+      new RegExp(
+        "Do you need to specify a token to authenticate to the registry?",
+      ),
+    ],
+  },
   [CliConfigErrorCategory.SwiftBuildFailed]: {
     cliErrorMessageCandidates: [
       new RegExp(
@@ -267,7 +285,7 @@ export const cliErrorsConfig: Record<
  * if not, return undefined.
  */
 export function getCliConfigCategoryIfExists(
-  cliError: CommandInvocationError,
+  cliError: CliError,
 ): CliConfigErrorCategory | undefined {
   for (const [category, configuration] of Object.entries(cliErrorsConfig)) {
     if (
@@ -293,11 +311,7 @@ export function getCliConfigCategoryIfExists(
  * error message appended, if it exists in a known set of configuration errors. Otherwise,
  * simply returns the original error.
  */
-export function wrapCliConfigurationError(cliError: Error): Error {
-  if (!(cliError instanceof CommandInvocationError)) {
-    return cliError;
-  }
-
+export function wrapCliConfigurationError(cliError: CliError): Error {
   const cliConfigErrorCategory = getCliConfigCategoryIfExists(cliError);
   if (cliConfigErrorCategory === undefined) {
     return cliError;

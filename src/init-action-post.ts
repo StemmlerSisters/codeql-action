@@ -6,7 +6,11 @@
 
 import * as core from "@actions/core";
 
-import { getTemporaryDirectory, printDebugLogs } from "./actions-util";
+import {
+  restoreInputs,
+  getTemporaryDirectory,
+  printDebugLogs,
+} from "./actions-util";
 import { getGitHubVersion } from "./api-client";
 import { Config, getConfig } from "./config-utils";
 import * as debugArtifacts from "./debug-artifacts";
@@ -42,6 +46,9 @@ async function runWrapper() {
     | initActionPostHelper.UploadFailedSarifResult
     | undefined;
   try {
+    // Restore inputs from `init` Action.
+    restoreInputs();
+
     const gitHubVersion = await getGitHubVersion();
     checkGitHubVersionInRange(gitHubVersion, logger);
 
@@ -60,18 +67,16 @@ async function runWrapper() {
       logger.warning(
         "Debugging artifacts are unavailable since the 'init' Action failed before it could produce any.",
       );
-      return;
+    } else {
+      uploadFailedSarifResult = await initActionPostHelper.run(
+        debugArtifacts.tryUploadAllAvailableDebugArtifacts,
+        printDebugLogs,
+        config,
+        repositoryNwo,
+        features,
+        logger,
+      );
     }
-
-    uploadFailedSarifResult = await initActionPostHelper.run(
-      debugArtifacts.uploadDatabaseBundleDebugArtifact,
-      debugArtifacts.uploadLogsDebugArtifact,
-      printDebugLogs,
-      config,
-      repositoryNwo,
-      features,
-      logger,
-    );
   } catch (unwrappedError) {
     const error = wrapError(unwrappedError);
     core.setFailed(error.message);
@@ -81,7 +86,7 @@ async function runWrapper() {
       getActionsStatus(error),
       startedAt,
       config,
-      await checkDiskUsage(),
+      await checkDiskUsage(logger),
       logger,
       error.message,
       error.stack,
@@ -99,7 +104,7 @@ async function runWrapper() {
     "success",
     startedAt,
     config,
-    await checkDiskUsage(),
+    await checkDiskUsage(logger),
     logger,
   );
   if (statusReportBase !== undefined) {

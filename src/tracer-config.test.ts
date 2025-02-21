@@ -6,7 +6,6 @@ import test from "ava";
 import * as configUtils from "./config-utils";
 import { Language } from "./languages";
 import {
-  createFeatures,
   createTestConfig,
   mockCodeQLVersion,
   setupTests,
@@ -30,11 +29,7 @@ test("getCombinedTracerConfig - return undefined when no languages are traced la
     // No traced languages
     config.languages = [Language.javascript, Language.python];
     t.deepEqual(
-      await getCombinedTracerConfig(
-        mockCodeQLVersion("1.0.0"),
-        config,
-        createFeatures([]),
-      ),
+      await getCombinedTracerConfig(mockCodeQLVersion("1.0.0"), config),
       undefined,
     );
   });
@@ -49,8 +44,8 @@ test("getCombinedTracerConfig - with start-tracing.json environment file", async
       process.platform === "win32"
         ? "win64"
         : process.platform === "darwin"
-        ? "osx64"
-        : "linux64";
+          ? "osx64"
+          : "linux64";
     const startTracingEnv = {
       foo: "bar",
       CODEQL_DIST: bundlePath,
@@ -72,7 +67,6 @@ test("getCombinedTracerConfig - with start-tracing.json environment file", async
     const result = await getCombinedTracerConfig(
       mockCodeQLVersion("1.0.0"),
       config,
-      createFeatures([]),
     );
     t.notDeepEqual(result, undefined);
 
@@ -110,8 +104,8 @@ test("getCombinedTracerConfig - with SetsCodeqlRunnerEnvVar feature enabled in C
       process.platform === "win32"
         ? "win64"
         : process.platform === "darwin"
-        ? "osx64"
-        : "linux64";
+          ? "osx64"
+          : "linux64";
     const startTracingEnv = {
       foo: "bar",
       CODEQL_DIST: bundlePath,
@@ -133,7 +127,6 @@ test("getCombinedTracerConfig - with SetsCodeqlRunnerEnvVar feature enabled in C
     const result = await getCombinedTracerConfig(
       mockCodeQLVersion("1.0.0", { setsCodeqlRunnerEnvVar: true }),
       config,
-      createFeatures([]),
     );
     t.notDeepEqual(result, undefined);
 

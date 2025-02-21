@@ -7,6 +7,7 @@ import * as yaml from "js-yaml";
 import * as sinon from "sinon";
 
 import * as api from "./api-client";
+import { CachingKind } from "./caching-utils";
 import {
   CodeQL,
   getCachedCodeQL,
@@ -52,6 +53,7 @@ function createTestInitConfigInputs(
       configInput: undefined,
       buildModeInput: undefined,
       trapCachingEnabled: false,
+      dependencyCachingEnabled: CachingKind.None,
       debugMode: false,
       debugArtifactName: "",
       debugDatabaseName: "",
@@ -81,7 +83,7 @@ function createConfigFile(inputFileContents: string, tmpDir: string): string {
   return configFilePath;
 }
 
-type GetContentsResponse = { content?: string } | Array<{}>;
+type GetContentsResponse = { content?: string } | object[];
 
 function mockGetContents(
   content: GetContentsResponse,
@@ -347,6 +349,7 @@ test("load non-empty input", async (t) => {
       augmentationProperties: configUtils.defaultAugmentationProperties,
       trapCaches: {},
       trapCacheDownloadTime: 0,
+      dependencyCachingEnabled: CachingKind.None,
     };
 
     const languagesInput = "javascript";
@@ -1086,44 +1089,56 @@ const mockRepositoryNwo = parseRepositoryNwo("owner/repo");
   });
 });
 
-test("Build mode not overridden when disable Java buildless feature flag disabled", async (t) => {
-  const messages: LoggedMessage[] = [];
-  const buildMode = await configUtils.parseBuildModeInput(
-    "none",
-    [Language.java],
-    createFeatures([]),
-    getRecordingLogger(messages),
-  );
-  t.is(buildMode, BuildMode.None);
-  t.deepEqual(messages, []);
-});
+for (const { displayName, language, feature } of [
+  {
+    displayName: "Java",
+    language: Language.java,
+    feature: Feature.DisableJavaBuildlessEnabled,
+  },
+  {
+    displayName: "C#",
+    language: Language.csharp,
+    feature: Feature.DisableCsharpBuildless,
+  },
+]) {
+  test(`Build mode not overridden when disable ${displayName} buildless feature flag disabled`, async (t) => {
+    const messages: LoggedMessage[] = [];
+    const buildMode = await configUtils.parseBuildModeInput(
+      "none",
+      [language],
+      createFeatures([]),
+      getRecordingLogger(messages),
+    );
+    t.is(buildMode, BuildMode.None);
+    t.deepEqual(messages, []);
+  });
 
-test("Build mode not overridden for other languages", async (t) => {
-  const messages: LoggedMessage[] = [];
-  const buildMode = await configUtils.parseBuildModeInput(
-    "none",
-    [Language.python],
-    createFeatures([Feature.DisableJavaBuildlessEnabled]),
-    getRecordingLogger(messages),
-  );
-  t.is(buildMode, BuildMode.None);
-  t.deepEqual(messages, []);
-});
+  test(`Build mode not overridden for other languages when disable ${displayName} buildless feature flag enabled`, async (t) => {
+    const messages: LoggedMessage[] = [];
+    const buildMode = await configUtils.parseBuildModeInput(
+      "none",
+      [Language.python],
+      createFeatures([feature]),
+      getRecordingLogger(messages),
+    );
+    t.is(buildMode, BuildMode.None);
+    t.deepEqual(messages, []);
+  });
 
-test("Build mode overridden when analyzing Java and disable Java buildless feature flag enabled", async (t) => {
-  const messages: LoggedMessage[] = [];
-  const buildMode = await configUtils.parseBuildModeInput(
-    "none",
-    [Language.java],
-    createFeatures([Feature.DisableJavaBuildlessEnabled]),
-    getRecordingLogger(messages),
-  );
-  t.is(buildMode, BuildMode.Autobuild);
-  t.deepEqual(messages, [
-    {
-      message:
-        "Scanning Java code without a build is temporarily unavailable. Falling back to 'autobuild' build mode.",
-      type: "warning",
-    },
-  ]);
-});
+  test(`Build mode overridden when analyzing ${displayName} and disable ${displayName} buildless feature flag enabled`, async (t) => {
+    const messages: LoggedMessage[] = [];
+    const buildMode = await configUtils.parseBuildModeInput(
+      "none",
+      [language],
+      createFeatures([feature]),
+      getRecordingLogger(messages),
+    );
+    t.is(buildMode, BuildMode.Autobuild);
+    t.deepEqual(messages, [
+      {
+        message: `Scanning ${displayName} code without a build is temporarily unavailable. Falling back to 'autobuild' build mode.`,
+        type: "warning",
+      },
+    ]);
+  });
+}

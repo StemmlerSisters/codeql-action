@@ -7,7 +7,6 @@ name: PR Check - Export file baseline information
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
-  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
@@ -37,22 +36,10 @@ jobs:
     name: Export file baseline information
     permissions:
       contents: read
-      security-events: write
+      security-events: read
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Setup Python on MacOS
-        uses: actions/setup-python@v5
-        if: >-
-          runner.os == 'macOS' && (
-
-          matrix.version == 'stable-20230403' ||
-
-          matrix.version == 'stable-v2.13.5' ||
-
-          matrix.version == 'stable-v2.14.6')
-        with:
-          python-version: '3.11'
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Prepare test
@@ -61,12 +48,14 @@ jobs:
         with:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
+          setup-kotlin: 'true'
       - uses: ./../action/init
         id: init
         with:
           languages: javascript
           tools: ${{ steps.prepare-test.outputs.tools-url }}
       - uses: ./../action/.github/actions/setup-swift
+        if: runner.os == 'macOS'
         with:
           codeql-path: ${{ steps.init.outputs.codeql-path }}
       - name: Build code
@@ -76,7 +65,7 @@ jobs:
         with:
           output: ${{ runner.temp }}/results
       - name: Upload SARIF
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: with-baseline-information-${{ matrix.os }}-${{ matrix.version }}.sarif.json
           path: ${{ runner.temp }}/results/javascript.sarif
@@ -86,7 +75,7 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/results"
           expected_baseline_languages="c csharp go java kotlin javascript python ruby"
-          if [[ $RUNNER_OS != "Windows" ]]; then
+          if [[ $RUNNER_OS == "macOS" ]]; then
             expected_baseline_languages+=" swift"
           fi
 

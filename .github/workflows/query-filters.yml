@@ -20,6 +20,8 @@ jobs:
     name: Query Filters Tests
     timeout-minutes: 45
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # This permission is needed to allow the GitHub Actions workflow to read the contents of the repository.
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -27,7 +29,7 @@ jobs:
       id: prepare-test
       uses: ./.github/actions/prepare-test
       with:
-        version: latest
+        version: linked
 
     - name: Check SARIF for default queries with Single include, Single exclude
       uses: ./../action/.github/actions/query-filter-test

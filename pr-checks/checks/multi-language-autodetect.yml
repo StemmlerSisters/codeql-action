@@ -1,7 +1,6 @@
 name: "Multi-language repository"
-description: "An end-to-end integration test of a multi-language repository using automatic language detection"
-# TODO: Add ubuntu back for `nightly-latest` and `latest` once CLI v2.17.4 is available.
-operatingSystems: ["macos"] 
+description: "An end-to-end integration test of a multi-language repository using automatic language detection for macOS"
+operatingSystems: ["macos", "ubuntu"]
 steps:
   - uses: actions/setup-go@v5
     with:
@@ -11,9 +10,11 @@ steps:
     id: init
     with:
       db-location: "${{ runner.temp }}/customDbLocation"
+      languages: ${{ runner.os == 'Linux' && 'cpp,csharp,go,java,javascript,python,ruby' || '' }}
       tools: ${{ steps.prepare-test.outputs.tools-url }}
 
   - uses: ./../action/.github/actions/setup-swift
+    if: runner.os == 'macOS'
     with:
       codeql-path: ${{ steps.init.outputs.codeql-path }}
 
@@ -65,8 +66,8 @@ steps:
         exit 1
       fi
 
-  - name: Check language autodetect for Swift
-    if: runner.os != 'Windows' && matrix.version != 'stable-20230403'
+  - name: Check language autodetect for Swift on macOS
+    if: runner.os == 'macOS'
     shell: bash
     run: |
       SWIFT_DB=${{ fromJson(steps.analysis.outputs.db-locations).swift }}

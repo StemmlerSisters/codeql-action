@@ -14,9 +14,11 @@ import * as api from "./api-client";
 import { getGitHubVersion, wrapApiConfigurationError } from "./api-client";
 import { CodeQL, getCodeQL } from "./codeql";
 import { getConfig } from "./config-utils";
+import { readDiffRangesJsonFile } from "./diff-filtering-utils";
 import { EnvVar } from "./environment";
-import { FeatureEnablement, Features } from "./feature-flags";
+import { FeatureEnablement } from "./feature-flags";
 import * as fingerprints from "./fingerprints";
+import * as gitUtils from "./git-utils";
 import { initCodeQL } from "./init";
 import { Logger } from "./logging";
 import { parseRepositoryNwo, RepositoryNwo } from "./repository";
@@ -24,12 +26,12 @@ import { ToolsFeature } from "./tools-features";
 import * as util from "./util";
 import {
   ConfigurationError,
+  getErrorMessage,
   getRequiredEnvParam,
   GitHubVariant,
   GitHubVersion,
   SarifFile,
   SarifRun,
-  wrapError,
 } from "./util";
 
 const GENERIC_403_MSG =
@@ -221,6 +223,7 @@ async function combineSarifFilesUsingCLI(
       tempDir,
       gitHubVersion.type,
       codeQLDefaultVersionInfo,
+      features,
       logger,
     );
 
@@ -309,7 +312,7 @@ async function uploadPayload(
   payload: any,
   repositoryNwo: RepositoryNwo,
   logger: Logger,
-) {
+): Promise<string> {
   logger.info("Uploading results");
 
   // If in test mode we don't want to upload the results
@@ -323,7 +326,7 @@ async function uploadPayload(
     );
     logger.info(`Payload: ${JSON.stringify(payload, null, 2)}`);
     fs.writeFileSync(payloadSaveFile, JSON.stringify(payload, null, 2));
-    return;
+    return "test-mode-sarif-id";
   }
 
   const client = api.getApiClient();
@@ -340,7 +343,7 @@ async function uploadPayload(
 
     logger.debug(`response status: ${response.status}`);
     logger.info("Successfully uploaded results");
-    return response.data.id;
+    return response.data.id as string;
   } catch (e) {
     if (util.isHTTPError(e)) {
       switch (e.status) {
@@ -389,32 +392,6 @@ export function findSarifFilesInDir(sarifPath: string): string[] {
   };
   walkSarifFiles(sarifPath);
   return sarifFiles;
-}
-
-/**
- * Uploads a single SARIF file or a directory of SARIF files depending on what `sarifPath` refers
- * to.
- */
-export async function uploadFromActions(
-  sarifPath: string,
-  checkoutPath: string,
-  category: string | undefined,
-  logger: Logger,
-): Promise<UploadResult> {
-  return await uploadFiles(
-    getSarifFilePaths(sarifPath),
-    parseRepositoryNwo(util.getRequiredEnvParam("GITHUB_REPOSITORY")),
-    await actionsUtil.getCommitOid(checkoutPath),
-    await actionsUtil.getRef(),
-    await api.getAnalysisKey(),
-    category,
-    util.getRequiredEnvParam("GITHUB_WORKFLOW"),
-    actionsUtil.getWorkflowRunID(),
-    actionsUtil.getWorkflowRunAttempt(),
-    checkoutPath,
-    actionsUtil.getRequiredInput("matrix"),
-    logger,
-  );
 }
 
 function getSarifFilePaths(sarifPath: string) {
@@ -466,19 +443,29 @@ export function validateSarifFileSchema(sarifFilePath: string, logger: Logger) {
     sarif = JSON.parse(fs.readFileSync(sarifFilePath, "utf8")) as SarifFile;
   } catch (e) {
     throw new InvalidSarifUploadError(
-      `Invalid SARIF. JSON syntax error: ${wrapError(e).message}`,
+      `Invalid SARIF. JSON syntax error: ${getErrorMessage(e)}`,
     );
   }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const schema = require("../src/sarif-schema-2.1.0.json") as jsonschema.Schema;
 
   const result = new jsonschema.Validator().validate(sarif, schema);
   // Filter errors related to invalid URIs in the artifactLocation field as this
   // is a breaking change. See https://github.com/github/codeql-action/issues/1703
-  const errors = (result.errors || []).filter(
-    (err) => err.argument !== "uri-reference",
+  const warningAttributes = ["uri-reference", "uri"];
+  const errors = (result.errors ?? []).filter(
+    (err) =>
+      !(
+        err.name === "format" &&
+        typeof err.argument === "string" &&
+        warningAttributes.includes(err.argument)
+      ),
   );
-  const warnings = (result.errors || []).filter(
-    (err) => err.argument === "uri-reference",
+  const warnings = (result.errors ?? []).filter(
+    (err) =>
+      err.name === "format" &&
+      typeof err.argument === "string" &&
+      warningAttributes.includes(err.argument),
   );
 
   for (const warning of warnings) {
@@ -563,32 +550,23 @@ export function buildPayload(
   return payloadObj;
 }
 
-// Uploads the given set of sarif files.
-// Returns true iff the upload occurred and succeeded
-async function uploadFiles(
-  sarifFiles: string[],
-  repositoryNwo: RepositoryNwo,
-  commitOid: string,
-  ref: string,
-  analysisKey: string,
+/**
+ * Uploads a single SARIF file or a directory of SARIF files depending on what `sarifPath` refers
+ * to.
+ */
+export async function uploadFiles(
+  sarifPath: string,
+  checkoutPath: string,
   category: string | undefined,
-  analysisName: string | undefined,
-  workflowRunID: number,
-  workflowRunAttempt: number,
-  sourceRoot: string,
-  environment: string | undefined,
+  features: FeatureEnablement,
   logger: Logger,
 ): Promise<UploadResult> {
+  const sarifFiles = getSarifFilePaths(sarifPath);
+
   logger.startGroup("Uploading results");
   logger.info(`Processing sarif files: ${JSON.stringify(sarifFiles)}`);
 
   const gitHubVersion = await getGitHubVersion();
-  const features = new Features(
-    gitHubVersion,
-    repositoryNwo,
-    actionsUtil.getTemporaryDirectory(),
-    logger,
-  );
 
   // Validate that the files we were asked to upload are all valid SARIF files
   for (const file of sarifFiles) {
@@ -601,8 +579,11 @@ async function uploadFiles(
     features,
     logger,
   );
-  sarif = await fingerprints.addFingerprints(sarif, sourceRoot, logger);
+  sarif = filterAlertsByDiffRange(logger, sarif);
+  sarif = await fingerprints.addFingerprints(sarif, checkoutPath, logger);
 
+  const analysisKey = await api.getAnalysisKey();
+  const environment = actionsUtil.getRequiredInput("matrix");
   sarif = populateRunAutomationDetails(
     sarif,
     category,
@@ -618,20 +599,20 @@ async function uploadFiles(
   const sarifPayload = JSON.stringify(sarif);
   logger.debug(`Compressing serialized SARIF`);
   const zippedSarif = zlib.gzipSync(sarifPayload).toString("base64");
-  const checkoutURI = fileUrl(sourceRoot);
+  const checkoutURI = fileUrl(checkoutPath);
 
   const payload = buildPayload(
-    commitOid,
-    ref,
+    await gitUtils.getCommitOid(checkoutPath),
+    await gitUtils.getRef(),
     analysisKey,
-    analysisName,
+    util.getRequiredEnvParam("GITHUB_WORKFLOW"),
     zippedSarif,
-    workflowRunID,
-    workflowRunAttempt,
+    actionsUtil.getWorkflowRunID(),
+    actionsUtil.getWorkflowRunAttempt(),
     checkoutURI,
     environment,
     toolNames,
-    await actionsUtil.determineMergeBaseCommitOid(),
+    await gitUtils.determineBaseBranchHeadCommitOid(),
   );
 
   // Log some useful debug info about the info
@@ -643,7 +624,11 @@ async function uploadFiles(
   logger.debug(`Number of results in upload: ${numResultInSarif}`);
 
   // Make the upload
-  const sarifID = await uploadPayload(payload, repositoryNwo, logger);
+  const sarifID = await uploadPayload(
+    payload,
+    parseRepositoryNwo(util.getRequiredEnvParam("GITHUB_REPOSITORY")),
+    logger,
+  );
 
   logger.endGroup();
 
@@ -735,8 +720,8 @@ export async function waitForProcessing(
         throw shouldConsiderConfigurationError(processingErrors)
           ? new ConfigurationError(message)
           : shouldConsiderInvalidRequest(processingErrors)
-          ? new InvalidSarifUploadError(message)
-          : new Error(message);
+            ? new InvalidSarifUploadError(message)
+            : new Error(message);
       } else {
         util.assertNever(status);
       }
@@ -792,6 +777,7 @@ function handleProcessingResultForUnsuccessfulExecution(
     status === "failed" &&
     Array.isArray(response.data.errors) &&
     response.data.errors.length === 1 &&
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call
     response.data.errors[0].toString().startsWith("unsuccessful execution")
   ) {
     logger.debug(
@@ -863,4 +849,51 @@ export class InvalidSarifUploadError extends Error {
   constructor(message: string) {
     super(message);
   }
+}
+
+function filterAlertsByDiffRange(logger: Logger, sarif: SarifFile): SarifFile {
+  const diffRanges = readDiffRangesJsonFile(logger);
+  if (!diffRanges?.length) {
+    return sarif;
+  }
+
+  const checkoutPath = actionsUtil.getRequiredInput("checkout_path");
+
+  for (const run of sarif.runs) {
+    if (run.results) {
+      run.results = run.results.filter((result) => {
+        const locations = [
+          ...(result.locations || []).map((loc) => loc.physicalLocation),
+          ...(result.relatedLocations || []).map((loc) => loc.physicalLocation),
+        ];
+
+        return locations.some((physicalLocation) => {
+          const locationUri = physicalLocation?.artifactLocation?.uri;
+          const locationStartLine = physicalLocation?.region?.startLine;
+          if (!locationUri || locationStartLine === undefined) {
+            return false;
+          }
+          // CodeQL always uses forward slashes as the path separator, so on Windows we
+          // need to replace any backslashes with forward slashes.
+          const locationPath = path
+            .join(checkoutPath, locationUri)
+            .replaceAll(path.sep, "/");
+          // Alert filtering here replicates the same behavior as the restrictAlertsTo
+          // extensible predicate in CodeQL. See the restrictAlertsTo documentation
+          // https://codeql.github.com/codeql-standard-libraries/csharp/codeql/util/AlertFiltering.qll/predicate.AlertFiltering$restrictAlertsTo.3.html
+          // for more details, such as why the filtering applies only to the first line
+          // of an alert location.
+          return diffRanges.some(
+            (range) =>
+              range.path === locationPath &&
+              ((range.startLine <= locationStartLine &&
+                range.endLine >= locationStartLine) ||
+                (range.startLine === 0 && range.endLine === 0)),
+          );
+        });
+      });
+    }
+  }
+
+  return sarif;
 }

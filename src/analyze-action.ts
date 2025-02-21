@@ -3,6 +3,7 @@ import path from "path";
 import { performance } from "perf_hooks";
 
 import * as core from "@actions/core";
+import * as github from "@actions/github";
 
 import * as actionsUtil from "./actions-util";
 import {
@@ -12,15 +13,18 @@ import {
   runCleanup,
   runFinalize,
   runQueries,
+  setupDiffInformedQueryRun,
   warnIfGoInstalledAfterInit,
 } from "./analyze";
 import { getApiDetails, getGitHubVersion } from "./api-client";
 import { runAutobuild } from "./autobuild";
+import { getTotalCacheSize, shouldStoreCache } from "./caching-utils";
 import { getCodeQL } from "./codeql";
 import { Config, getConfig } from "./config-utils";
 import { uploadDatabases } from "./database-upload";
+import { uploadDependencyCaches } from "./dependency-caching";
 import { EnvVar } from "./environment";
-import { FeatureEnablement, Features } from "./feature-flags";
+import { Features } from "./feature-flags";
 import { Language } from "./languages";
 import { getActionsLogger, Logger } from "./logging";
 import { parseRepositoryNwo } from "./repository";
@@ -34,7 +38,6 @@ import {
 } from "./status-report";
 import {
   cleanupTrapCaches,
-  getTotalCacheSize,
   TrapCacheCleanupStatusReport,
   uploadTrapCaches,
 } from "./trap-caching";
@@ -75,7 +78,7 @@ async function sendStatusReport(
     status,
     startedAt,
     config,
-    await util.checkDiskUsage(),
+    await util.checkDiskUsage(logger),
     logger,
     error?.message,
     error?.stack,
@@ -92,7 +95,7 @@ async function sendStatusReport(
         ...report,
         trap_cache_upload_duration_ms: Math.round(trapCacheUploadTime || 0),
         trap_cache_upload_size_bytes: Math.round(
-          await getTotalCacheSize(config.trapCaches, logger),
+          await getTotalCacheSize(Object.values(config.trapCaches), logger),
         ),
       };
       await statusReport.sendStatusReport(trapCacheUploadStatusReport);
@@ -147,11 +150,7 @@ function doesGoExtractionOutputExist(config: Config): boolean {
  * - We approximate whether manual build steps are present by looking at
  * whether any extraction output already exists for Go.
  */
-async function runAutobuildIfLegacyGoWorkflow(
-  config: Config,
-  features: FeatureEnablement,
-  logger: Logger,
-) {
+async function runAutobuildIfLegacyGoWorkflow(config: Config, logger: Logger) {
   if (!config.languages.includes(Language.go)) {
     return;
   }
@@ -188,7 +187,7 @@ async function runAutobuildIfLegacyGoWorkflow(
   logger.debug(
     "Running Go autobuild because extraction output (TRAP files) for Go code has not been found.",
   );
-  await runAutobuild(config, Language.go, features, logger);
+  await runAutobuild(config, Language.go, logger);
 }
 
 async function run() {
@@ -202,6 +201,19 @@ async function run() {
   let dbCreationTimings: DatabaseCreationTimings | undefined = undefined;
   let didUploadTrapCaches = false;
   util.initializeEnvironment(actionsUtil.getActionVersion());
+
+  // Unset the CODEQL_PROXY_* environment variables, as they are not needed
+  // and can cause issues with the CodeQL CLI
+  // Check for CODEQL_PROXY_HOST: and if it is empty but set, unset it
+  if (process.env.CODEQL_PROXY_HOST === "") {
+    delete process.env.CODEQL_PROXY_HOST;
+    delete process.env.CODEQL_PROXY_PORT;
+    delete process.env.CODEQL_PROXY_CA_CERTIFICATE;
+  }
+
+  // Make inputs accessible in the `post` step, details at
+  // https://github.com/github/codeql-action/issues/2553
+  actionsUtil.persistInputs();
 
   const logger = getActionsLogger();
   try {
@@ -234,6 +246,7 @@ async function run() {
 
     const apiDetails = getApiDetails();
     const outputDir = actionsUtil.getRequiredInput("output");
+    core.exportVariable(EnvVar.SARIF_RESULTS_OUTPUT_DIR, outputDir);
     const threads = util.getThreadsFlag(
       actionsUtil.getOptionalInput("threads") || process.env["CODEQL_THREADS"],
       logger,
@@ -259,8 +272,19 @@ async function run() {
       logger,
     );
 
+    const pull_request = github.context.payload.pull_request;
+    const diffRangePackDir =
+      pull_request &&
+      (await setupDiffInformedQueryRun(
+        pull_request.base.ref as string,
+        pull_request.head.label as string,
+        codeql,
+        logger,
+        features,
+      ));
+
     await warnIfGoInstalledAfterInit(config, logger);
-    await runAutobuildIfLegacyGoWorkflow(config, features, logger);
+    await runAutobuildIfLegacyGoWorkflow(config, logger);
 
     dbCreationTimings = await runFinalize(
       outputDir,
@@ -268,7 +292,6 @@ async function run() {
       memory,
       codeql,
       config,
-      features,
       logger,
     );
 
@@ -278,6 +301,7 @@ async function run() {
         memory,
         util.getAddSnippetsFlag(actionsUtil.getRequiredInput("add-snippets")),
         threads,
+        diffRangePackDir,
         actionsUtil.getOptionalInput("category"),
         config,
         logger,
@@ -301,10 +325,11 @@ async function run() {
     core.setOutput("sarif-output", path.resolve(outputDir));
     const uploadInput = actionsUtil.getOptionalInput("upload");
     if (runStats && actionsUtil.getUploadValue(uploadInput) === "always") {
-      uploadResult = await uploadLib.uploadFromActions(
+      uploadResult = await uploadLib.uploadFiles(
         outputDir,
         actionsUtil.getRequiredInput("checkout_path"),
         actionsUtil.getOptionalInput("category"),
+        features,
         logger,
       );
       core.setOutput("sarif-id", uploadResult.sarifID);
@@ -326,6 +351,11 @@ async function run() {
       features,
       logger,
     );
+
+    // Store dependency cache(s) if dependency caching is enabled.
+    if (shouldStoreCache(config.dependencyCachingEnabled)) {
+      await uploadDependencyCaches(config, logger);
+    }
 
     // We don't upload results in test mode, so don't wait for processing
     if (util.isInTestMode()) {
@@ -356,33 +386,19 @@ async function run() {
       core.setFailed(error.message);
     }
 
-    if (error instanceof CodeQLAnalysisError) {
-      const stats = { ...error.queriesStatusReport };
-      await sendStatusReport(
-        startedAt,
-        config,
-        stats,
-        error,
-        trapCacheUploadTime,
-        dbCreationTimings,
-        didUploadTrapCaches,
-        trapCacheCleanupTelemetry,
-        logger,
-      );
-    } else {
-      await sendStatusReport(
-        startedAt,
-        config,
-        undefined,
-        error,
-        trapCacheUploadTime,
-        dbCreationTimings,
-        didUploadTrapCaches,
-        trapCacheCleanupTelemetry,
-        logger,
-      );
-    }
-
+    await sendStatusReport(
+      startedAt,
+      config,
+      error instanceof CodeQLAnalysisError
+        ? error.queriesStatusReport
+        : undefined,
+      error instanceof CodeQLAnalysisError ? error.error : error,
+      trapCacheUploadTime,
+      dbCreationTimings,
+      didUploadTrapCaches,
+      trapCacheCleanupTelemetry,
+      logger,
+    );
     return;
   }
 
@@ -434,7 +450,7 @@ async function runWrapper() {
   try {
     await runPromise;
   } catch (error) {
-    core.setFailed(`analyze action failed: ${util.wrapError(error).message}`);
+    core.setFailed(`analyze action failed: ${util.getErrorMessage(error)}`);
   }
   await util.checkForTimeout();
 }

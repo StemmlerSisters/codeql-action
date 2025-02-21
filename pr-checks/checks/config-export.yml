@@ -1,6 +1,6 @@
 name: "Config export"
 description: "Tests that the code scanning configuration file is exported to SARIF correctly."
-versions: ["latest", "nightly-latest"]
+versions: ["linked", "nightly-latest"]
 steps:
   - uses: ./../action/init
     with:
@@ -12,7 +12,7 @@ steps:
       output: "${{ runner.temp }}/results"
       upload-database: false
   - name: Upload SARIF
-    uses: actions/upload-artifact@v3
+    uses: actions/upload-artifact@v4
     with:
       name: config-export-${{ matrix.os }}-${{ matrix.version }}.sarif.json
       path: "${{ runner.temp }}/results/javascript.sarif"

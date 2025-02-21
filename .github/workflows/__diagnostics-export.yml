@@ -7,7 +7,6 @@ name: PR Check - Diagnostic export
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GO111MODULE: auto
-  CODEQL_EXTRACTOR_JAVA_AGENT_DISABLE_KOTLIN: 'true'
 on:
   push:
     branches:
@@ -29,17 +28,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            version: stable-20230403
-          - os: macos-12
-            version: stable-20230403
-          - os: windows-latest
-            version: stable-20230403
-          - os: ubuntu-latest
-            version: latest
+            version: linked
           - os: macos-latest
-            version: latest
+            version: linked
           - os: windows-latest
-            version: latest
+            version: linked
           - os: ubuntu-latest
             version: nightly-latest
           - os: macos-latest
@@ -49,22 +42,10 @@ jobs:
     name: Diagnostic export
     permissions:
       contents: read
-      security-events: write
+      security-events: read
     timeout-minutes: 45
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Setup Python on MacOS
-        uses: actions/setup-python@v5
-        if: >-
-          runner.os == 'macOS' && (
-
-          matrix.version == 'stable-20230403' ||
-
-          matrix.version == 'stable-v2.13.5' ||
-
-          matrix.version == 'stable-v2.14.6')
-        with:
-          python-version: '3.11'
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Prepare test
@@ -73,6 +54,7 @@ jobs:
         with:
           version: ${{ matrix.version }}
           use-all-platform-bundle: 'false'
+          setup-kotlin: 'true'
       - uses: ./../action/init
         id: init
         with:
@@ -83,23 +65,19 @@ jobs:
         env:
           CODEQL_PATH: ${{ steps.init.outputs.codeql-path }}
         run: |
-          for i in {1..2}; do
-            # Use the same location twice to test the workaround for the bug in CodeQL CLI 2.12.6 that
-            # produces an invalid diagnostic with multiple identical location objects.
-            "$CODEQL_PATH" database add-diagnostic \
-              "$RUNNER_TEMP/codeql_databases/javascript" \
-              --file-path /path/to/file \
-              --plaintext-message "Plaintext message $i" \
-              --source-id "lang/diagnostics/example" \
-              --source-name "Diagnostic name" \
-              --ready-for-status-page
-          done
+          "$CODEQL_PATH" database add-diagnostic \
+            "$RUNNER_TEMP/codeql_databases/javascript" \
+            --file-path /path/to/file \
+            --plaintext-message "Plaintext message" \
+            --source-id "lang/diagnostics/example" \
+            --source-name "Diagnostic name" \
+            --ready-for-status-page
       - uses: ./../action/analyze
         with:
           output: ${{ runner.temp }}/results
           upload-database: false
       - name: Upload SARIF
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: diagnostics-export-${{ matrix.os }}-${{ matrix.version }}.sarif.json
           path: ${{ runner.temp }}/results/javascript.sarif
@@ -113,7 +91,7 @@ jobs:
             const fs = require('fs');
 
             function checkStatusPageNotification(n) {
-              const expectedMessage = 'Plaintext message 1\n\nCodeQL also found 1 other diagnostic like this. See the workflow log for details.';
+              const expectedMessage = 'Plaintext message';
               if (n.message.text !== expectedMessage) {
                 core.setFailed(`Expected the status page diagnostic to have the message '${expectedMessage}', but found '${n.message.text}'.`);
               }

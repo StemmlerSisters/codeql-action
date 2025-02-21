@@ -5,3 +5,7 @@ node_modules/.cache/
 *.class
 # macOS
 .DS_Store
+# eslint sarif report
+eslint.sarif
+# for local incremental compilation
+tsconfig.tsbuildinfo

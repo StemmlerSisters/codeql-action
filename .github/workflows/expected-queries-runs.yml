@@ -22,6 +22,9 @@ jobs:
       CODEQL_ACTION_TEST_MODE: true
     timeout-minutes: 45
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
     steps:
     - name: Check out repository
       uses: actions/checkout@v4
@@ -29,7 +32,7 @@ jobs:
       id: prepare-test
       uses: ./.github/actions/prepare-test
       with:
-        version: latest
+        version: linked
     - uses: ./../action/init
       with:
         languages: javascript
@@ -37,8 +40,6 @@ jobs:
     - uses: ./../action/analyze
       with:
         output: ${{ runner.temp }}/results
-        upload-database: false
-        upload: never
 
     - name: Check Sarif
       uses: ./../action/.github/actions/check-sarif

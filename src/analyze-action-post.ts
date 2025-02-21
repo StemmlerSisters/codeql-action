@@ -5,23 +5,42 @@
  */
 import * as core from "@actions/core";
 
-import * as analyzeActionPostHelper from "./analyze-action-post-helper";
+import * as actionsUtil from "./actions-util";
+import { getGitHubVersion } from "./api-client";
+import { getCodeQL } from "./codeql";
+import { getConfig } from "./config-utils";
 import * as debugArtifacts from "./debug-artifacts";
-import * as uploadSarifActionPostHelper from "./upload-sarif-action-post-helper";
-import { wrapError } from "./util";
+import { EnvVar } from "./environment";
+import { getActionsLogger } from "./logging";
+import { checkGitHubVersionInRange, getErrorMessage } from "./util";
 
 async function runWrapper() {
   try {
-    await analyzeActionPostHelper.run(debugArtifacts.uploadSarifDebugArtifact);
+    actionsUtil.restoreInputs();
+    const logger = getActionsLogger();
+    const gitHubVersion = await getGitHubVersion();
+    checkGitHubVersionInRange(gitHubVersion, logger);
 
-    // Also run the upload-sarif post action since we're potentially running
-    // the same steps in the analyze action.
-    await uploadSarifActionPostHelper.uploadArtifacts(
-      debugArtifacts.uploadDebugArtifacts,
-    );
+    // Upload SARIF artifacts if we determine that this is a first-party analysis run.
+    // For third-party runs, this artifact will be uploaded in the `upload-sarif-post` step.
+    if (process.env[EnvVar.INIT_ACTION_HAS_RUN] === "true") {
+      const config = await getConfig(
+        actionsUtil.getTemporaryDirectory(),
+        logger,
+      );
+      if (config !== undefined) {
+        const codeql = await getCodeQL(config.codeQLCmd);
+        const version = await codeql.getVersion();
+        await debugArtifacts.uploadCombinedSarifArtifacts(
+          logger,
+          config.gitHubVersion.type,
+          version.version,
+        );
+      }
+    }
   } catch (error) {
     core.setFailed(
-      `analyze post-action step failed: ${wrapError(error).message}`,
+      `analyze post-action step failed: ${getErrorMessage(error)}`,
     );
   }
 }
